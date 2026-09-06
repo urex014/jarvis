@@ -48,20 +48,42 @@ def send_ipc_event(socket_path: str, event_type: str, data: dict) -> bool:
         logger.debug("IPC send error: %s", e)
         return False
 
-def clean_text_for_speech(raw_text: str) -> str:
-    """Strips code blocks, excessive formatting, and markdown for natural speech."""
+def clean_text_for_speech(raw_text: str, max_sentences: int = 2, max_words: int = 30) -> str:
+    """Strips markdown and limits output to at most 1-2 concise sentences for speech."""
     import re
     # Remove code blocks
-    text = re.sub(r"```[\s\S]*?```", "Code block omitted.", raw_text)
+    text = re.sub(r"```[\s\S]*?```", "", raw_text)
     # Remove inline code
     text = re.sub(r"`([^`]+)`", r"\1", text)
     # Remove markdown links, keep label
     text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
     # Remove special characters / markdown headers
-    text = re.sub(r"[#*_~>]", " ", text)
+    text = re.sub(r"[#*_~>|]", " ", text)
     # Collapse multiple whitespaces
     text = re.sub(r"\s+", " ", text).strip()
-    return text
+    if not text:
+        return ""
+
+    # Split into sentences using punctuation boundaries (. ! ?)
+    sentence_matches = re.split(r'(?<=[.!?])\s+', text)
+    selected_sentences = []
+    word_count = 0
+
+    for s in sentence_matches:
+        s = s.strip()
+        if not s:
+            continue
+        words = s.split()
+        if not selected_sentences or (len(selected_sentences) < max_sentences and word_count + len(words) <= max_words):
+            selected_sentences.append(s)
+            word_count += len(words)
+        else:
+            break
+
+    result = " ".join(selected_sentences).strip()
+    if result and result[-1] not in ".!?":
+        result += "."
+    return result
 
 def synthesize_with_elevenlabs(text: str, output_path: str, api_key: str) -> bool:
     """Synthesizes speech using ElevenLabs API with British voice."""
@@ -186,8 +208,24 @@ def speak_text(text: str, socket_path: str = DEFAULT_SOCKET_PATH, model_path: st
         "text": clean_text
     })
 
-    # 4. Play audio through speakers
-    play_audio(OUTPUT_WAV)
+    speaking_flag = "/tmp/jarvis_is_speaking"
+    try:
+        with open(speaking_flag, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+
+    try:
+        # 4. Play audio through speakers
+        play_audio(OUTPUT_WAV)
+    finally:
+        # Echo dampening cooldown: allows speaker reverberation to decay
+        time.sleep(0.4)
+        if os.path.exists(speaking_flag):
+            try:
+                os.remove(speaking_flag)
+            except Exception:
+                pass
 
     # 5. Notify UI that audio playback has finished -> triggers auto-hide logic
     logger.info("Audio playback complete. Emitting finished event to initiate auto-hide timer.")

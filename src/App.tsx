@@ -190,6 +190,14 @@ export default function App() {
               setAgentProcessStatus("[Systems nominal // Awaiting directive]");
               startAutoHideTimer(4000);
             }
+          } else if (data.event === "stop" || data.action === "stop") {
+            cancelAutoHideTimer();
+            setIsSpeaking(false);
+            setIsAgentBusy(false);
+            setIsListening(false);
+            setStatusMessage("OPERATION HALTED // PLAYBACK & TASKS TERMINATED");
+            setAgentProcessStatus("[Operation halted by directive]");
+            startAutoHideTimer(3000);
           }
         };
 
@@ -485,6 +493,22 @@ export default function App() {
       // Fallback
     }
   };
+
+  // Emergency stop handler to immediately kill speech playback and agent reasoning
+  const handleEmergencyStop = useCallback(() => {
+    cancelAutoHideTimer();
+    setIsSpeaking(false);
+    setIsAgentBusy(false);
+    setIsListening(false);
+    setStatusMessage("OPERATION CANCELLED // DIRECTIVES HALTED");
+    setAgentProcessStatus("[Operation halted by user]");
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ action: "stop" }));
+    }
+
+    startAutoHideTimer(3000);
+  }, [cancelAutoHideTimer, startAutoHideTimer]);
 
   // Simulate token-by-token streaming STT text with automatic command handoff on completion
   const handleSimulateTokenStream = async () => {
@@ -886,6 +910,14 @@ export default function App() {
         {/* Test Controls & Telemetry Footer */}
         <div className="flex items-center justify-between text-[10px] font-mono text-cyan-400/50 pt-1.5 border-t border-cyan-500/10">
           <div className="flex items-center gap-2 flex-wrap">
+            <button
+              onClick={handleEmergencyStop}
+              className="px-2.5 py-0.5 rounded border border-red-500/70 bg-red-950/80 text-red-300 font-bold hover:bg-red-900/90 cursor-pointer transition-colors shadow-[0_0_8px_rgba(239,68,68,0.3)]"
+              title="Emergency halt of audio playback and agent processing"
+            >
+              STOP
+            </button>
+            <span>•</span>
             <button
               onClick={toggleWebAudioStream}
               className={`px-2 py-0.5 rounded border transition-colors cursor-pointer ${

@@ -104,13 +104,13 @@ def run_daemon(model_path: str, socket_path: str, voice_script: str, device=None
     else:
         model = Model(model_path)
 
-    # Constrain grammar to wake words + unk to maximize speed and minimize CPU
-    grammar = '["jarvis", "hey jarvis", "[unk]"]'
+    # Constrain grammar to wake words + stop directives + unk
+    grammar = '["jarvis", "hey jarvis", "stop", "cancel", "quiet", "shut up", "halt", "[unk]"]'
     samplerate = 16000
     recognizer = KaldiRecognizer(model, samplerate, grammar)
     recognizer.SetWords(False)
 
-    logger.info("Wake word grammar loaded: 'jarvis', 'hey jarvis'.")
+    logger.info("Wake & stop grammar loaded: 'jarvis', 'hey jarvis', 'stop', 'cancel', 'quiet', 'halt'.")
     logger.info("Opening audio input stream at %d Hz...", samplerate)
 
     cooldown_seconds = 2.5
@@ -135,7 +135,11 @@ def run_daemon(model_path: str, socket_path: str, voice_script: str, device=None
                 if recognizer.AcceptWaveform(data):
                     res = json.loads(recognizer.Result())
                     text = res.get("text", "").strip().lower()
-                    if text in ("jarvis", "hey jarvis"):
+                    if text in ("stop", "cancel", "quiet", "shut up", "halt"):
+                        logger.info(">>> STOP DIRECTIVE DETECTED: '%s' <<<", text)
+                        subprocess.run(["bash", str(PROJECT_ROOT / "scripts" / "emergency_stop.sh")])
+                        recognizer.Reset()
+                    elif text in ("jarvis", "hey jarvis"):
                         now = time.time()
                         if now - last_trigger_time > cooldown_seconds:
                             last_trigger_time = now
@@ -149,7 +153,11 @@ def run_daemon(model_path: str, socket_path: str, voice_script: str, device=None
                     # Check partial result for lower latency
                     partial = json.loads(recognizer.PartialResult())
                     partial_text = partial.get("partial", "").strip().lower()
-                    if partial_text in ("jarvis", "hey jarvis"):
+                    if partial_text in ("stop", "cancel", "quiet", "shut up", "halt"):
+                        logger.info(">>> STOP DIRECTIVE DETECTED (PARTIAL): '%s' <<<", partial_text)
+                        recognizer.Reset()
+                        subprocess.run(["bash", str(PROJECT_ROOT / "scripts" / "emergency_stop.sh")])
+                    elif partial_text in ("jarvis", "hey jarvis"):
                         now = time.time()
                         if now - last_trigger_time > cooldown_seconds:
                             last_trigger_time = now

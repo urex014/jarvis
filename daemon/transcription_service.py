@@ -24,6 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("JarvisSTT")
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SOCKET_PATH = "/tmp/jarvis.sock"
 DEFAULT_MODEL_DIR = os.path.expanduser("~/.cache/vosk/vosk-model-small-en-us-0.15")
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
@@ -161,6 +162,21 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
                         final_text = res.get("text", "").strip()
                         if final_text:
                             logger.info("[STT FINAL] %s", final_text)
+
+                            # 1. Immediate stop command check
+                            if re.search(r'\b(stop|cancel|quiet|shut up|halt)\b', final_text, re.IGNORECASE):
+                                logger.info(">>> STOP DIRECTIVE DETECTED VIA STT: '%s' <<<", final_text)
+                                subprocess.run(["bash", str(PROJECT_ROOT / "scripts" / "emergency_stop.sh")])
+                                recognizer.Reset()
+                                last_partial = ""
+                                continue
+
+                            # 2. Check if TTS is currently active -> drop self-echo!
+                            if os.path.exists("/tmp/jarvis_is_speaking"):
+                                logger.debug("TTS active; discarding speaker acoustic feedback: '%s'", final_text)
+                                last_partial = ""
+                                continue
+
                             ipc.send_event("stt_final", {
                                 "text": final_text,
                                 "result": res.get("result", [])
@@ -195,13 +211,26 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
                     else:
                         partial_res = json.loads(recognizer.PartialResult())
                         partial_text = partial_res.get("partial", "").strip()
-                        if partial_text and partial_text != last_partial:
-                            last_partial = partial_text
-                            logger.debug("[STT PARTIAL] %s", partial_text)
-                            ipc.send_event("stt_partial", {
-                                "text": partial_text,
-                                "partial_result": partial_res.get("partial_result", [])
-                            })
+                        if partial_text:
+                            # Immediate stop check on partial tokens
+                            if re.search(r'\b(stop|cancel|quiet|shut up|halt)\b', partial_text, re.IGNORECASE):
+                                logger.info(">>> STOP DIRECTIVE DETECTED (PARTIAL): '%s' <<<", partial_text)
+                                recognizer.Reset()
+                                subprocess.run(["bash", str(PROJECT_ROOT / "scripts" / "emergency_stop.sh")])
+                                last_partial = ""
+                                continue
+
+                            # Discard partial tokens while TTS is playing
+                            if os.path.exists("/tmp/jarvis_is_speaking"):
+                                continue
+
+                            if partial_text != last_partial:
+                                last_partial = partial_text
+                                logger.debug("[STT PARTIAL] %s", partial_text)
+                                ipc.send_event("stt_partial", {
+                                    "text": partial_text,
+                                    "partial_result": partial_res.get("partial_result", [])
+                                })
 
         except Exception as e:
             if running:

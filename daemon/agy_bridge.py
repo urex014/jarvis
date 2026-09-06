@@ -100,8 +100,48 @@ def map_tool_to_status(tool_name: str) -> str:
     else:
         return f"[Running {tool_name}...]"
 
+current_agy_process = None
+current_tts_process = None
+
+async def stop_all_execution(socket_path: str):
+    """Emergency stop: halts active agy process, audio players, and resets states."""
+    global current_agy_process, current_tts_process
+    logger.info(">>> EMERGENCY STOP ACTIVATED BY DIRECTIVE <<<")
+    if current_agy_process:
+        try:
+            current_agy_process.kill()
+        except Exception:
+            pass
+        current_agy_process = None
+
+    if current_tts_process:
+        try:
+            current_tts_process.kill()
+        except Exception:
+            pass
+        current_tts_process = None
+
+    for p in ["paplay", "pw-play", "aplay"]:
+        subprocess.run(["pkill", "-9", p], capture_output=True)
+
+    if os.path.exists("/tmp/jarvis_is_speaking"):
+        try:
+            os.remove("/tmp/jarvis_is_speaking")
+        except Exception:
+            pass
+
+    await broadcast_event(socket_path, "agent_status", {
+        "status": "[Operation halted by user]",
+        "is_busy": False
+    })
+    await broadcast_event(socket_path, "tts_state", {
+        "state": "finished",
+        "status": "[Halted]"
+    })
+
 async def execute_agy_prompt(prompt: str, socket_path: str):
     """Executes agy CLI with the prompt and streams process updates."""
+    global current_agy_process
     logger.info("Executing agy prompt: '%s'", prompt)
 
     await broadcast_event(socket_path, "agent_status", {
@@ -110,11 +150,18 @@ async def execute_agy_prompt(prompt: str, socket_path: str):
         "is_busy": True
     })
 
+    # Strict voice directive: short, crisp, under 25 words
+    brief_prompt = (
+        f"{prompt}\n\n"
+        f"[VOICE DIRECTIVE: Provide an impeccably concise response in 1-2 brief sentences, "
+        f"strictly under 25 words total, suitable for British voice synthesis. Address user as Sir.]"
+    )
+
     cmd = [
         "agy",
         "--output-format", "stream-json",
         "--dangerously-skip-permissions",
-        f"--print={prompt}"
+        f"--print={brief_prompt}"
     ]
 
     try:
@@ -124,6 +171,7 @@ async def execute_agy_prompt(prompt: str, socket_path: str):
             stderr=asyncio.subprocess.PIPE,
             cwd="/home/cryptic/projects/jarvis"
         )
+        current_agy_process = process
 
         response_chunks = []
 
@@ -196,6 +244,7 @@ async def execute_agy_prompt(prompt: str, socket_path: str):
 
 async def invoke_tts_synthesis(text: str, socket_path: str, simulate: bool = False):
     """Spawns the TTS engine to synthesize and play the response audio."""
+    global current_tts_process
     tts_script = str(PROJECT_ROOT / "daemon" / "tts_service.py")
     python_bin = str(PROJECT_ROOT / ".venv" / "bin" / "python")
     cmd = [python_bin, tts_script, text, "--socket-path", socket_path]
@@ -203,9 +252,12 @@ async def invoke_tts_synthesis(text: str, socket_path: str, simulate: bool = Fal
         cmd.append("--simulate")
     try:
         proc = await asyncio.create_subprocess_exec(*cmd)
+        current_tts_process = proc
         await proc.wait()
     except Exception as e:
         logger.error("Error executing TTS service: %s", e)
+    finally:
+        current_tts_process = None
 
 async def simulate_agent_flow(prompt: str, socket_path: str):
     """Simulates realistic agy process telemetry updates for testing."""
@@ -253,9 +305,14 @@ async def start_unix_listener(agent_sock_path: str, tauri_sock_path: str):
                 line = data.decode("utf-8").strip()
                 if line:
                     payload = json.loads(line)
-                    prompt = payload.get("prompt") or payload.get("text", "")
-                    if prompt:
-                        asyncio.create_task(execute_agy_prompt(prompt, tauri_sock_path))
+                    action = payload.get("action")
+                    event = payload.get("event")
+                    if action in ("stop", "cancel") or event in ("stop", "cancel"):
+                        asyncio.create_task(stop_all_execution(tauri_sock_path))
+                    else:
+                        prompt = payload.get("prompt") or payload.get("text", "")
+                        if prompt:
+                            asyncio.create_task(execute_agy_prompt(prompt, tauri_sock_path))
         except Exception as e:
             logger.debug("Agent socket handler error: %s", e)
         finally:
@@ -283,7 +340,9 @@ async def start_websocket_server(host: str, port: int, tauri_sock_path: str):
                 try:
                     data = json.loads(message)
                     action = data.get("action") or data.get("event")
-                    if action == "prompt":
+                    if action in ("stop", "cancel"):
+                        asyncio.create_task(stop_all_execution(tauri_sock_path))
+                    elif action == "prompt":
                         prompt = data.get("text") or data.get("prompt", "")
                         if prompt:
                             asyncio.create_task(execute_agy_prompt(prompt, tauri_sock_path))

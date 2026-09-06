@@ -87,7 +87,12 @@ class JarvisOverlayWindow(Gtk.Window):
 
     def on_key_press(self, widget, event):
         if event.keyval == Gdk.KEY_Escape:
-            logger.info("Escape pressed. Concealing HUD overlay.")
+            logger.info("Escape pressed. Executing emergency stop and concealing HUD overlay.")
+            try:
+                import subprocess
+                subprocess.Popen(["bash", str(PROJECT_ROOT / "scripts" / "emergency_stop.sh")])
+            except Exception:
+                pass
             self.hide_overlay()
             return True
         return False
