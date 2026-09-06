@@ -140,31 +140,70 @@ export default function App() {
           }
         };
 
+        const handleEventData = (data: any) => {
+          if (!data || !data.event) return;
+          if (data.event === "wake_word") {
+            cancelAutoHideTimer();
+            const phrase = data.phrase || "jarvis";
+            setDetectedPhrase(phrase);
+            setIsVisible(true);
+            setIsListening(true);
+            setStatusMessage(`WAKE DETECTED: "${phrase.toUpperCase()}" // STT STREAM ROUTED`);
+            setTranscribedPartial("");
+            if (inputRef.current) inputRef.current.focus();
+          } else if (data.event === "stt_partial") {
+            cancelAutoHideTimer();
+            const text = data.text || "";
+            setTranscribedPartial(text);
+            setIsListening(true);
+            setStatusMessage("TRANSCRIBING // STREAMING AUDIO TOKENS");
+          } else if (data.event === "stt_final") {
+            cancelAutoHideTimer();
+            const text = data.text || "";
+            if (text) {
+              setTranscribedFinal((prev) => (prev ? `${prev} ${text}` : text));
+            }
+            setTranscribedPartial("");
+            setStatusMessage("TRANSCRIPTION COMMITTED // AWAITING DIRECTIVE");
+          } else if (data.event === "stt_state") {
+            const state = data.state || "idle";
+            if (state === "listening") {
+              cancelAutoHideTimer();
+              setIsListening(true);
+            } else if (state === "idle") {
+              setIsListening(false);
+            }
+          } else if (data.event === "agent_status") {
+            setAgentProcessStatus(data.status || "[Processing...]");
+            setIsAgentBusy(data.is_busy !== undefined ? data.is_busy : true);
+          } else if (data.event === "agent_response") {
+            setAgentResponse(data.response || data.text || "");
+            setIsAgentBusy(false);
+            setAgentProcessStatus("[Task completed // Response ready]");
+          } else if (data.event === "tts_state") {
+            if (data.state === "speaking") {
+              cancelAutoHideTimer();
+              setIsSpeaking(true);
+              setAgentProcessStatus("[Speaking...]");
+            } else if (data.state === "finished") {
+              setIsSpeaking(false);
+              setAgentProcessStatus("[Systems nominal // Awaiting directive]");
+              startAutoHideTimer(4000);
+            }
+          }
+        };
+
         ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
-            if (data.event === "agent_status") {
-              setAgentProcessStatus(data.status || "[Processing...]");
-              setIsAgentBusy(data.is_busy !== undefined ? data.is_busy : true);
-            } else if (data.event === "agent_response") {
-              setAgentResponse(data.response || data.text || "");
-              setIsAgentBusy(false);
-              setAgentProcessStatus("[Task completed // Response ready]");
-            } else if (data.event === "tts_state") {
-              if (data.state === "speaking") {
-                cancelAutoHideTimer();
-                setIsSpeaking(true);
-                setAgentProcessStatus("[Speaking...]");
-              } else if (data.state === "finished") {
-                setIsSpeaking(false);
-                setAgentProcessStatus("[Systems nominal // Awaiting directive]");
-                startAutoHideTimer(4000);
-              }
-            }
+            handleEventData(data);
           } catch {
             // Ignore non-JSON
           }
         };
+
+        // Also expose event hook to window for native webview dispatch
+        (window as any).__JARVIS_DISPATCH__ = handleEventData;
 
         ws.onclose = () => {
           if (isMounted) {

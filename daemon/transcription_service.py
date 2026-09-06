@@ -14,6 +14,7 @@ import signal
 import logging
 import argparse
 import threading
+import re
 from pathlib import Path
 
 logging.basicConfig(
@@ -164,20 +165,32 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
                                 "text": final_text,
                                 "result": res.get("result", [])
                             })
-                            # Trigger command handoff to agy agent once silence threshold is reached
-                            ipc.send_event("command_handoff", {
-                                "prompt": final_text,
-                                "source": "speech_silence_threshold"
-                            })
-                            # Forward directly to agent socket if present
-                            if os.path.exists("/tmp/jarvis_agent.sock"):
-                                try:
-                                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as agent_sock:
-                                        agent_sock.settimeout(1.0)
-                                        agent_sock.connect("/tmp/jarvis_agent.sock")
-                                        agent_sock.sendall((json.dumps({"action": "prompt", "prompt": final_text}) + "\n").encode("utf-8"))
-                                except Exception as err:
-                                    logger.debug("Could not handoff to agent socket: %s", err)
+
+                            # Strip wake phrases if present at start of transcription
+                            clean_prompt = re.sub(r'^(hey\s+)?jarvis\s*,?\s*', '', final_text, flags=re.IGNORECASE).strip()
+                            words = clean_prompt.split()
+
+                            # Filter out single-word acoustic noise artifacts
+                            is_noise = len(words) <= 1 and clean_prompt.lower() in (
+                                "huh", "um", "ah", "the", "a", "oh", "er", "m", "mm", "hmm", "is", "but", "one", "uni", "cool"
+                            )
+
+                            if clean_prompt and not is_noise:
+                                # Trigger command handoff to agy agent once silence threshold is reached
+                                ipc.send_event("command_handoff", {
+                                    "prompt": clean_prompt,
+                                    "source": "speech_silence_threshold"
+                                })
+                                # Forward directly to agent socket if present
+                                if os.path.exists("/tmp/jarvis_agent.sock"):
+                                    try:
+                                        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as agent_sock:
+                                            agent_sock.settimeout(1.0)
+                                            agent_sock.connect("/tmp/jarvis_agent.sock")
+                                            agent_sock.sendall((json.dumps({"action": "prompt", "prompt": clean_prompt}) + "\n").encode("utf-8"))
+                                            logger.info("Dispatched prompt to agent socket: '%s'", clean_prompt)
+                                    except Exception as err:
+                                        logger.debug("Could not handoff to agent socket: %s", err)
                             last_partial = ""
                     else:
                         partial_res = json.loads(recognizer.PartialResult())

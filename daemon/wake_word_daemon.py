@@ -41,28 +41,38 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-def notify_tauri_overlay(socket_path: str, phrase: str):
-    """Sends wake-word detection event to the Tauri app via Unix domain socket."""
-    if not os.path.exists(socket_path):
-        logger.warning("Tauri socket %s not found. Overlay UI may not be running.", socket_path)
-        return False
+def play_wake_ack():
+    """Immediately plays acoustic acknowledgement ('Yes, Sir?') through system speakers."""
+    ack_path = PROJECT_ROOT / "wake_ack.wav"
+    if ack_path.exists():
+        try:
+            subprocess.Popen(["paplay", str(ack_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logger.info("Acoustic wake acknowledgement dispatched ('Yes, Sir?').")
+        except Exception as e:
+            logger.debug("Acoustic playback failed: %s", e)
 
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(2.0)
-            client.connect(socket_path)
-            payload = {
-                "event": "wake_word",
-                "phrase": phrase,
-                "timestamp": int(time.time() * 1000)
-            }
-            message = json.dumps(payload) + "\n"
-            client.sendall(message.encode("utf-8"))
-            logger.info("Dispatched IPC wake event to Tauri overlay: %s", payload)
-            return True
-    except Exception as e:
-        logger.error("Failed to transmit wake event to Tauri socket: %s", e)
-        return False
+def notify_tauri_overlay(socket_path: str, phrase: str) -> bool:
+    """Dispatches wake-word event to Tauri overlay and agent bridge sockets."""
+    payload = {
+        "event": "wake_word",
+        "phrase": phrase,
+        "timestamp": int(time.time() * 1000)
+    }
+    raw = (json.dumps(payload) + "\n").encode("utf-8")
+    sent = False
+
+    for target in [socket_path, "/tmp/jarvis_agent.sock"]:
+        if os.path.exists(target):
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.settimeout(1.0)
+                    client.connect(target)
+                    client.sendall(raw)
+                    sent = True
+                    logger.info("Dispatched wake event to %s: %s", target, payload)
+            except Exception as e:
+                logger.debug("Failed sending to %s: %s", target, e)
+    return sent
 
 def trigger_voice_routing(voice_script_path: str):
     """Executes the voice route script to pipe microphone input to transcription."""
@@ -130,6 +140,7 @@ def run_daemon(model_path: str, socket_path: str, voice_script: str, device=None
                         if now - last_trigger_time > cooldown_seconds:
                             last_trigger_time = now
                             logger.info(">>> WAKE PHRASE DETECTED: '%s' <<<", text)
+                            play_wake_ack()
                             notify_tauri_overlay(socket_path, text)
                             trigger_voice_routing(voice_script)
                         else:
@@ -144,6 +155,7 @@ def run_daemon(model_path: str, socket_path: str, voice_script: str, device=None
                             last_trigger_time = now
                             logger.info(">>> WAKE PHRASE DETECTED (PARTIAL): '%s' <<<", partial_text)
                             recognizer.Reset()
+                            play_wake_ack()
                             notify_tauri_overlay(socket_path, partial_text)
                             trigger_voice_routing(voice_script)
 

@@ -25,6 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AgyBridge")
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SOCKET_PATH = "/tmp/jarvis.sock"
 AGENT_SOCKET_PATH = "/tmp/jarvis_agent.sock"
 WS_HOST = "127.0.0.1"
