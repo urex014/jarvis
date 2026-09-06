@@ -15,6 +15,7 @@ import logging
 import argparse
 import threading
 import re
+import subprocess
 from pathlib import Path
 
 logging.basicConfig(
@@ -124,6 +125,7 @@ def stream_simulation(ipc: IPCClient, text: str):
 
 def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
     """Reads raw 16kHz PCM from FIFO and streams transcribed tokens to Tauri."""
+    global running
     from vosk import Model, KaldiRecognizer, SetLogLevel
     SetLogLevel(-1)
 
@@ -143,18 +145,30 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
     last_partial = ""
     chunk_size = 4000 # 250ms at 16kHz S16_LE (2 bytes per sample)
 
+    session_start_time = time.time()
+    MAX_TURN_SECONDS = 7.0
+
     while running:
         if not os.path.exists(fifo_path):
-            time.sleep(0.2)
+            time.sleep(0.1)
+            if time.time() - session_start_time > MAX_TURN_SECONDS:
+                break
             continue
 
         try:
             with open(fifo_path, "rb") as fifo:
                 logger.info("Connected to audio stream buffer.")
                 while running:
+                    # Timeout check: single turn ends if user says nothing
+                    if time.time() - session_start_time > MAX_TURN_SECONDS:
+                        logger.info("Turn duration exceeded (%.1fs). Shutting down microphone capture.", MAX_TURN_SECONDS)
+                        subprocess.Popen(["bash", str(PROJECT_ROOT / "scripts" / "voice_route.sh"), "stop"])
+                        running = False
+                        break
+
                     data = fifo.read(chunk_size)
                     if not data:
-                        time.sleep(0.05)
+                        time.sleep(0.04)
                         continue
 
                     if recognizer.AcceptWaveform(data):
@@ -167,9 +181,9 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
                             if re.search(r'\b(stop|cancel|quiet|shut up|halt)\b', final_text, re.IGNORECASE):
                                 logger.info(">>> STOP DIRECTIVE DETECTED VIA STT: '%s' <<<", final_text)
                                 subprocess.run(["bash", str(PROJECT_ROOT / "scripts" / "emergency_stop.sh")])
-                                recognizer.Reset()
-                                last_partial = ""
-                                continue
+                                subprocess.Popen(["bash", str(PROJECT_ROOT / "scripts" / "voice_route.sh"), "stop"])
+                                running = False
+                                break
 
                             # 2. Check if TTS is currently active -> drop self-echo!
                             if os.path.exists("/tmp/jarvis_is_speaking"):
@@ -192,12 +206,12 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
                             )
 
                             if clean_prompt and not is_noise:
-                                # Trigger command handoff to agy agent once silence threshold is reached
+                                logger.info("Directive accepted: '%s'. Dispatching prompt and stopping microphone capture.", clean_prompt)
                                 ipc.send_event("command_handoff", {
                                     "prompt": clean_prompt,
                                     "source": "speech_silence_threshold"
                                 })
-                                # Forward directly to agent socket if present
+                                ipc.send_event("stt_state", {"state": "idle"})
                                 if os.path.exists("/tmp/jarvis_agent.sock"):
                                     try:
                                         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as agent_sock:
@@ -207,6 +221,11 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
                                             logger.info("Dispatched prompt to agent socket: '%s'", clean_prompt)
                                     except Exception as err:
                                         logger.debug("Could not handoff to agent socket: %s", err)
+
+                                # Shut down microphone capture immediately to eliminate speaker echo
+                                subprocess.Popen(["bash", str(PROJECT_ROOT / "scripts" / "voice_route.sh"), "stop"])
+                                running = False
+                                break
                             last_partial = ""
                     else:
                         partial_res = json.loads(recognizer.PartialResult())
@@ -215,10 +234,10 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
                             # Immediate stop check on partial tokens
                             if re.search(r'\b(stop|cancel|quiet|shut up|halt)\b', partial_text, re.IGNORECASE):
                                 logger.info(">>> STOP DIRECTIVE DETECTED (PARTIAL): '%s' <<<", partial_text)
-                                recognizer.Reset()
                                 subprocess.run(["bash", str(PROJECT_ROOT / "scripts" / "emergency_stop.sh")])
-                                last_partial = ""
-                                continue
+                                subprocess.Popen(["bash", str(PROJECT_ROOT / "scripts" / "voice_route.sh"), "stop"])
+                                running = False
+                                break
 
                             # Discard partial tokens while TTS is playing
                             if os.path.exists("/tmp/jarvis_is_speaking"):

@@ -142,6 +142,15 @@ async def stop_all_execution(socket_path: str):
 async def execute_agy_prompt(prompt: str, socket_path: str):
     """Executes agy CLI with the prompt and streams process updates."""
     global current_agy_process
+
+    # Kill any existing agent execution to prevent concurrent responses
+    if current_agy_process:
+        try:
+            current_agy_process.kill()
+        except Exception:
+            pass
+        current_agy_process = None
+
     logger.info("Executing agy prompt: '%s'", prompt)
 
     await broadcast_event(socket_path, "agent_status", {
@@ -245,6 +254,18 @@ async def execute_agy_prompt(prompt: str, socket_path: str):
 async def invoke_tts_synthesis(text: str, socket_path: str, simulate: bool = False):
     """Spawns the TTS engine to synthesize and play the response audio."""
     global current_tts_process
+
+    # Kill any existing TTS playback to prevent overlapping voices
+    if current_tts_process:
+        try:
+            current_tts_process.kill()
+        except Exception:
+            pass
+        current_tts_process = None
+
+    for p in ["paplay", "pw-play", "aplay"]:
+        subprocess.run(["pkill", "-9", p], capture_output=True)
+
     tts_script = str(PROJECT_ROOT / "daemon" / "tts_service.py")
     python_bin = str(PROJECT_ROOT / ".venv" / "bin" / "python")
     cmd = [python_bin, tts_script, text, "--socket-path", socket_path]

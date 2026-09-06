@@ -4,13 +4,18 @@
 # Halts audio playback, active TTS, and running agent processes immediately.
 # ==============================================================================
 
-# 1. Kill audio players immediately
+# 1. Stop active microphone capture immediately
+bash /home/cryptic/projects/jarvis/scripts/voice_route.sh stop >/dev/null 2>&1 || true
+
+# 2. Kill audio players immediately
 pkill -9 paplay 2>/dev/null || true
 pkill -9 pw-play 2>/dev/null || true
 pkill -9 aplay 2>/dev/null || true
+pkill -9 spd-say 2>/dev/null || true
 
-# 2. Kill TTS worker processes
-pkill -f "daemon/tts_service.py" 2>/dev/null || true
+# 3. Kill Piper and TTS worker processes
+pkill -9 -f "piper" 2>/dev/null || true
+pkill -9 -f "daemon/tts_service.py" 2>/dev/null || true
 
 # 3. Clear speaking state flag
 rm -f /tmp/jarvis_is_speaking

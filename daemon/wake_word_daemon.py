@@ -46,8 +46,9 @@ def play_wake_ack():
     ack_path = PROJECT_ROOT / "wake_ack.wav"
     if ack_path.exists():
         try:
-            subprocess.Popen(["paplay", str(ack_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            logger.info("Acoustic wake acknowledgement dispatched ('Yes, Sir?').")
+            proc = subprocess.Popen(["paplay", str(ack_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc.wait(timeout=1.2)
+            logger.info("Acoustic wake acknowledgement completed ('Yes, Sir?').")
         except Exception as e:
             logger.debug("Acoustic playback failed: %s", e)
 

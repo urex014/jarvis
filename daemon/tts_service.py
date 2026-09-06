@@ -144,17 +144,21 @@ def synthesize_with_piper(text: str, output_path: str, model_path: str) -> bool:
         return False
 
 def play_audio(audio_path: str):
-    """Plays audio through system speakers via paplay, pw-play, or aplay."""
-    players = ["paplay", "pw-play", "aplay"]
-    for player in players:
-        if subprocess.run(["which", player], capture_output=True).returncode == 0:
-            logger.info("Playing audio via %s...", player)
-            try:
-                subprocess.run([player, audio_path], check=True, capture_output=True)
-                return True
-            except Exception as e:
-                logger.warning("%s playback failed: %s", player, e)
-    return False
+    """Plays audio through system speakers via paplay (primary PipeWire/Pulse player)."""
+    player = "paplay"
+    if subprocess.run(["which", player], capture_output=True).returncode != 0:
+        player = "pw-play"
+
+    logger.info("Playing audio via %s...", player)
+    try:
+        proc = subprocess.run([player, audio_path], capture_output=True)
+        if proc.returncode != 0:
+            logger.info("%s terminated (exit code %d).", player, proc.returncode)
+            return False
+        return True
+    except Exception as e:
+        logger.warning("Audio playback error: %s", e)
+        return False
 
 def speak_text(text: str, socket_path: str = DEFAULT_SOCKET_PATH, model_path: str = DEFAULT_PIPER_MODEL):
     """Coordinates the full TTS synthesis, status dispatch, and playback cycle."""
@@ -183,17 +187,7 @@ def speak_text(text: str, socket_path: str = DEFAULT_SOCKET_PATH, model_path: st
         success = synthesize_with_piper(clean_text, OUTPUT_WAV, model_path)
 
     if not success:
-        # Fallback to speech-dispatcher if piper unavailable
-        logger.info("Falling back to speech-dispatcher (spd-say)...")
-        send_ipc_event(socket_path, "tts_state", {
-            "state": "speaking",
-            "status": "[Speaking...]",
-            "text": clean_text
-        })
-        try:
-            subprocess.run(["spd-say", "-r", "-10", clean_text])
-        except Exception:
-            pass
+        logger.info("Speech synthesis not completed or cancelled.")
         send_ipc_event(socket_path, "tts_state", {
             "state": "finished",
             "status": "[Systems nominal // Awaiting directive]",
