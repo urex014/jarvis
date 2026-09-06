@@ -151,7 +151,7 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
     last_partial_time = 0.0
 
     def commit_prompt(final_text: str, result_meta: list = None) -> bool:
-        nonlocal running
+        global running
         if not final_text:
             return False
 
