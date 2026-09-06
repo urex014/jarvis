@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
@@ -15,6 +15,18 @@ interface SttPayload {
   token_count?: number;
 }
 
+interface AgentStatusPayload {
+  status: string;
+  is_busy?: boolean;
+  prompt?: string;
+}
+
+interface AgentResponsePayload {
+  response?: string;
+  text?: string;
+  done?: boolean;
+}
+
 export default function App() {
   const [time, setTime] = useState("");
   const [isVisible, setIsVisible] = useState(true);
@@ -28,9 +40,18 @@ export default function App() {
   const [transcribedFinal, setTranscribedFinal] = useState("");
   const [transcribedPartial, setTranscribedPartial] = useState("");
   
+  // Phase 4: agy Agent State Management
+  const [agentProcessStatus, setAgentProcessStatus] = useState("[Systems nominal // Awaiting directive]");
+  const [isAgentBusy, setIsAgentBusy] = useState(false);
+  const [agentResponse, setAgentResponse] = useState("");
+  const [autoHandoffEnabled, setAutoHandoffEnabled] = useState(true);
+  const [isWsConnected, setIsWsConnected] = useState(false);
+
   const inputRef = useRef<HTMLInputElement>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Digital clock update
   useEffect(() => {
@@ -50,7 +71,94 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
-  // Listen for Tauri backend events: wake word, partial STT, final STT, and states
+  // Connect to local agy WebSocket bridge (ws://127.0.0.1:9002) with auto-reconnect
+  useEffect(() => {
+    let reconnectTimeout: ReturnType<typeof setTimeout>;
+    let isMounted = true;
+
+    function connectWs() {
+      try {
+        const ws = new WebSocket("ws://127.0.0.1:9002");
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          if (isMounted) {
+            setIsWsConnected(true);
+          }
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.event === "agent_status") {
+              setAgentProcessStatus(data.status || "[Processing...]");
+              setIsAgentBusy(data.is_busy !== undefined ? data.is_busy : true);
+            } else if (data.event === "agent_response") {
+              setAgentResponse(data.response || data.text || "");
+              setIsAgentBusy(false);
+              setAgentProcessStatus("[Task completed // Response ready]");
+            }
+          } catch {
+            // Ignore non-JSON
+          }
+        };
+
+        ws.onclose = () => {
+          if (isMounted) {
+            setIsWsConnected(false);
+            reconnectTimeout = setTimeout(connectWs, 3000);
+          }
+        };
+
+        ws.onerror = () => {
+          if (isMounted) {
+            setIsWsConnected(false);
+          }
+        };
+      } catch {
+        if (isMounted) {
+          reconnectTimeout = setTimeout(connectWs, 3000);
+        }
+      }
+    }
+
+    connectWs();
+
+    return () => {
+      isMounted = false;
+      clearTimeout(reconnectTimeout);
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, []);
+
+  // Dispatch prompt to agy agent via WebSocket or Tauri IPC
+  const handoffPromptToAgent = useCallback(async (promptText: string) => {
+    const trimmed = promptText.trim();
+    if (!trimmed) return;
+
+    setIsAgentBusy(true);
+    setAgentProcessStatus("[Analyzing prompt & planning strategy...]");
+    setStatusMessage(`HANDING OFF PROMPT TO AGY: "${trimmed}"`);
+
+    // 1. Send via WebSocket if available
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        action: "prompt",
+        prompt: trimmed
+      }));
+    }
+
+    // 2. Also forward via Tauri invoke for IPC bridge
+    try {
+      await invoke("submit_agy_prompt", { prompt: trimmed });
+    } catch {
+      // Fallback
+    }
+  }, []);
+
+  // Listen for Tauri backend events
   useEffect(() => {
     const unlistenFns: (() => void)[] = [];
 
@@ -77,14 +185,32 @@ export default function App() {
           setTranscribedPartial(text);
           setIsListening(true);
           setStatusMessage("TRANSCRIBING // STREAMING AUDIO TOKENS");
+
+          // Silence threshold detection: 1.5s after last partial token
+          if (silenceTimerRef.current) {
+            clearTimeout(silenceTimerRef.current);
+          }
+          if (autoHandoffEnabled && text) {
+            silenceTimerRef.current = setTimeout(() => {
+              handoffPromptToAgent(text);
+              setTranscribedFinal((prev) => (prev ? `${prev} ${text}` : text));
+              setTranscribedPartial("");
+            }, 1500);
+          }
         });
         unlistenFns.push(unlistenPartial);
 
-        // 3. STT final recognized phrase
+        // 3. STT final recognized phrase (speech boundary / silence threshold reached by engine)
         const unlistenFinal = await listen<SttPayload>("stt-final", (event) => {
           const text = event.payload?.text || "";
+          if (silenceTimerRef.current) {
+            clearTimeout(silenceTimerRef.current);
+          }
           if (text) {
             setTranscribedFinal((prev) => (prev ? `${prev} ${text}` : text));
+            if (autoHandoffEnabled) {
+              handoffPromptToAgent(text);
+            }
           }
           setTranscribedPartial("");
           setStatusMessage("TRANSCRIPTION COMMITTED // AWAITING DIRECTIVE");
@@ -102,6 +228,25 @@ export default function App() {
         });
         unlistenFns.push(unlistenState);
 
+        // 5. agy Agent Status updates from Tauri IPC
+        const unlistenAgentStatus = await listen<AgentStatusPayload>("agent-status", (event) => {
+          const status = event.payload?.status || "[Processing...]";
+          setAgentProcessStatus(status);
+          if (event.payload?.is_busy !== undefined) {
+            setIsAgentBusy(event.payload.is_busy);
+          }
+        });
+        unlistenFns.push(unlistenAgentStatus);
+
+        // 6. agy Agent Response from Tauri IPC
+        const unlistenAgentResp = await listen<AgentResponsePayload>("agent-response", (event) => {
+          const resp = event.payload?.response || event.payload?.text || "";
+          setAgentResponse(resp);
+          setIsAgentBusy(false);
+          setAgentProcessStatus("[Task completed // Response ready]");
+        });
+        unlistenFns.push(unlistenAgentResp);
+
       } catch (err) {
         console.warn("Tauri event listener failed to bind:", err);
       }
@@ -111,8 +256,11 @@ export default function App() {
 
     return () => {
       unlistenFns.forEach((fn) => fn());
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+      }
     };
-  }, []);
+  }, [autoHandoffEnabled, handoffPromptToAgent]);
 
   // Keyboard shortcut: Escape hides window
   useEffect(() => {
@@ -147,7 +295,6 @@ export default function App() {
         audioContextRef.current = ctx;
         const source = ctx.createMediaStreamSource(stream);
 
-        // Simple audio visualizer analyser
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 64;
         source.connect(analyser);
@@ -156,7 +303,6 @@ export default function App() {
         setIsListening(true);
         setStatusMessage("WEBRTC AUDIO CAPTURE LIVE // STREAMING MICROPHONE");
 
-        // Also trigger backend voice route
         try {
           await invoke("trigger_voice_route");
         } catch {
@@ -211,7 +357,7 @@ export default function App() {
     }
   };
 
-  // Simulate token-by-token streaming STT text directly into frontend
+  // Simulate token-by-token streaming STT text with automatic command handoff on completion
   const handleSimulateTokenStream = async () => {
     setIsVisible(true);
     setIsListening(true);
@@ -219,13 +365,13 @@ export default function App() {
 
     const sampleTokens = [
       "Jarvis,",
-      "report",
-      "diagnostic",
+      "inspect",
+      "project",
       "status",
       "and",
-      "prepare",
-      "overlay",
-      "telemetry."
+      "review",
+      "git",
+      "commits."
     ];
 
     let currentString = "";
@@ -240,12 +386,13 @@ export default function App() {
       } catch {
         // Fallback
       }
-      await new Promise((r) => setTimeout(r, 120));
+      await new Promise((r) => setTimeout(r, 110));
     }
 
     setTranscribedFinal((prev) => (prev ? `${prev} ${currentString}` : currentString));
     setTranscribedPartial("");
     setStatusMessage("SIMULATED TRANSCRIPTION COMMITTED");
+    
     try {
       await invoke("push_stt_token", {
         text: currentString,
@@ -254,12 +401,48 @@ export default function App() {
     } catch {
       // Fallback
     }
+
+    // Silence threshold trigger handoff
+    if (autoHandoffEnabled) {
+      handoffPromptToAgent(currentString);
+    }
+  };
+
+  // Simulate agy agent process telemetry steps
+  const handleSimulateAgentTelemetry = async () => {
+    setIsAgentBusy(true);
+    try {
+      await invoke("simulate_agy_workflow", {
+        prompt: "Analyze system diagnostics and codebase status"
+      });
+    } catch {
+      // Fallback directly via state
+      const steps = [
+        "[Analyzing prompt & planning strategy...]",
+        "[Searching file system...]",
+        "[Analyzing logs & source files...]",
+        "[Generating response...]"
+      ];
+      for (const step of steps) {
+        setAgentProcessStatus(step);
+        await new Promise((r) => setTimeout(r, 700));
+      }
+      setAgentProcessStatus("[Systems nominal // Awaiting directive]");
+      setAgentResponse("Diagnostics confirm all operations nominal. Primary workspace in optimal health, Sir.");
+      setIsAgentBusy(false);
+    }
   };
 
   const handleClearTranscript = () => {
     setTranscribedFinal("");
     setTranscribedPartial("");
     setStatusMessage("TRANSCRIPTION BUFFER CLEARED");
+  };
+
+  const handleClearAgentResponse = () => {
+    setAgentResponse("");
+    setAgentProcessStatus("[Systems nominal // Awaiting directive]");
+    setIsAgentBusy(false);
   };
 
   const handleCommandSubmit = (e: React.FormEvent) => {
@@ -277,10 +460,14 @@ export default function App() {
       handleSimulateWake();
     } else if (trimmed === "/clear") {
       handleClearTranscript();
-    } else if (trimmed === "/test") {
+      handleClearAgentResponse();
+    } else if (trimmed === "/test-stt") {
       handleSimulateTokenStream();
+    } else if (trimmed === "/test-agent") {
+      handleSimulateAgentTelemetry();
     } else {
-      setStatusMessage(`COMMAND EXECUTED: "${trimmed}"`);
+      // Direct command submitted to agy agent
+      handoffPromptToAgent(trimmed);
     }
     setInputValue("");
   };
@@ -289,7 +476,7 @@ export default function App() {
     <main className="w-screen h-screen flex flex-col items-center justify-center p-6 select-none bg-transparent">
       {/* HUD Container with CSS Fade-In and Scale Transition */}
       <div
-        className={`w-full max-w-xl rounded-2xl bg-neutral-950/85 backdrop-blur-2xl border border-cyan-500/30 p-6 shadow-2xl shadow-cyan-950/60 text-slate-100 flex flex-col gap-4 transform transition-all duration-500 ease-out ${
+        className={`w-full max-w-xl rounded-2xl bg-neutral-950/90 backdrop-blur-2xl border border-cyan-500/30 p-6 shadow-2xl shadow-cyan-950/60 text-slate-100 flex flex-col gap-3.5 transform transition-all duration-500 ease-out ${
           isVisible
             ? "opacity-100 scale-100 translate-y-0"
             : "opacity-0 scale-95 -translate-y-4 pointer-events-none"
@@ -301,12 +488,20 @@ export default function App() {
             <span className="relative flex h-3 w-3">
               <span
                 className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
-                  isListening || isWebAudioActive ? "bg-emerald-400" : "bg-cyan-400"
+                  isListening || isWebAudioActive
+                    ? "bg-emerald-400"
+                    : isAgentBusy
+                    ? "bg-amber-400"
+                    : "bg-cyan-400"
                 }`}
               ></span>
               <span
                 className={`relative inline-flex rounded-full h-3 w-3 ${
-                  isListening || isWebAudioActive ? "bg-emerald-500" : "bg-cyan-500"
+                  isListening || isWebAudioActive
+                    ? "bg-emerald-500"
+                    : isAgentBusy
+                    ? "bg-amber-500"
+                    : "bg-cyan-500"
                 }`}
               ></span>
             </span>
@@ -319,7 +514,7 @@ export default function App() {
             <button
               onClick={handleDismiss}
               title="Dismiss Window (Esc)"
-              className="text-xs font-mono text-cyan-500 hover:text-cyan-300 px-2 py-0.5 rounded border border-cyan-500/20 hover:border-cyan-500/50 transition-colors"
+              className="text-xs font-mono text-cyan-500 hover:text-cyan-300 px-2 py-0.5 rounded border border-cyan-500/20 hover:border-cyan-500/50 transition-colors cursor-pointer"
             >
               ESC ✕
             </button>
@@ -327,8 +522,8 @@ export default function App() {
         </div>
 
         {/* Audio Visualizer & Wave Activity */}
-        <div className="flex items-center justify-between bg-black/40 rounded-xl px-4 py-3 border border-cyan-500/10">
-          <div className="flex flex-col gap-1">
+        <div className="flex items-center justify-between bg-black/40 rounded-xl px-4 py-2.5 border border-cyan-500/10">
+          <div className="flex flex-col gap-0.5">
             <div className="flex items-center gap-2">
               <span className="text-[10px] font-mono text-cyan-400/60 uppercase tracking-widest">
                 Acoustic Telemetry
@@ -356,7 +551,7 @@ export default function App() {
           </div>
 
           {/* Dynamic Audio Wave Bars */}
-          <div className="flex items-end gap-1 h-8">
+          <div className="flex items-end gap-1 h-7">
             {[40, 75, 100, 60, 90, 45, 80, 55, 30].map((height, idx) => (
               <span
                 key={idx}
@@ -374,8 +569,45 @@ export default function App() {
           </div>
         </div>
 
-        {/* Glowing Minimalist Real-Time Transcription Text Block */}
-        <div className="relative rounded-xl bg-white/[0.02] border border-white/10 p-4 shadow-inner backdrop-blur-md overflow-hidden min-h-[95px] flex flex-col justify-between transition-all duration-300">
+        {/* Phase 4: Agent Process Display - Secondary Smaller Field with subtle pulse animation */}
+        <div className="flex items-center justify-between px-3.5 py-2 rounded-xl bg-cyan-950/20 border border-cyan-500/20 text-xs font-mono transition-all">
+          <div className="flex items-center gap-2.5 overflow-hidden">
+            <span className="relative flex h-2 w-2 flex-shrink-0">
+              {isAgentBusy ? (
+                <>
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-cyan-500"></span>
+                </>
+              ) : (
+                <span className="inline-flex rounded-full h-2 w-2 bg-slate-500/60"></span>
+              )}
+            </span>
+            <span className="text-[10px] text-cyan-400/60 uppercase tracking-widest flex-shrink-0">
+              PROCESS:
+            </span>
+            <span
+              className={`tracking-wide text-xs truncate ${
+                isAgentBusy
+                  ? "text-cyan-200 animate-pulse font-medium drop-shadow-[0_0_8px_rgba(34,211,238,0.6)]"
+                  : "text-slate-400"
+              }`}
+            >
+              {agentProcessStatus}
+            </span>
+          </div>
+          <div className="flex items-center gap-1.5 flex-shrink-0 text-[9px] font-mono text-cyan-400/50">
+            <span title={statusMessage} className="hidden md:inline text-cyan-500/70 truncate max-w-[140px]">{statusMessage}</span>
+            <span className="hidden md:inline">•</span>
+            <span>IPC</span>
+            <span>•</span>
+            <span className={isWsConnected ? "text-emerald-400" : "text-slate-500"}>
+              WS {isWsConnected ? "ON" : "OFF"}
+            </span>
+          </div>
+        </div>
+
+        {/* Real-Time Transcription Minimalist Glowing White Text Block */}
+        <div className="relative rounded-xl bg-white/[0.02] border border-white/10 p-4 shadow-inner backdrop-blur-md overflow-hidden min-h-[85px] flex flex-col justify-between transition-all duration-300">
           <div className="flex items-center justify-between border-b border-white/5 pb-2 mb-2">
             <div className="flex items-center gap-2">
               <span className="inline-block w-2 h-2 rounded-full bg-cyan-400 shadow-[0_0_6px_#22d3ee] animate-pulse"></span>
@@ -384,7 +616,17 @@ export default function App() {
               </span>
             </div>
             <div className="flex items-center gap-2 text-[10px] font-mono text-cyan-400/80">
-              <span>ENGINE: VOSK OFFLINE</span>
+              <span
+                onClick={() => setAutoHandoffEnabled(!autoHandoffEnabled)}
+                className={`cursor-pointer px-1.5 py-0.5 rounded border text-[9px] transition-colors ${
+                  autoHandoffEnabled
+                    ? "bg-cyan-950/60 text-cyan-300 border-cyan-500/40"
+                    : "bg-neutral-900 text-slate-500 border-neutral-700"
+                }`}
+                title="Automatically submit prompt to agy agent when silence is reached"
+              >
+                AUTO-HANDOFF: {autoHandoffEnabled ? "ON" : "OFF"}
+              </span>
               {(transcribedFinal || transcribedPartial) && (
                 <button
                   onClick={handleClearTranscript}
@@ -397,7 +639,7 @@ export default function App() {
           </div>
 
           {/* Glowing Transcribed Tokens Stream */}
-          <div className="font-mono text-sm leading-relaxed select-text min-h-[44px] break-words">
+          <div className="font-mono text-sm leading-relaxed select-text min-h-[40px] break-words">
             {transcribedFinal && (
               <span className="text-white drop-shadow-[0_0_8px_rgba(255,255,255,0.4)] font-light">
                 {transcribedFinal}{" "}
@@ -410,7 +652,7 @@ export default function App() {
               </span>
             ) : !transcribedFinal ? (
               <span className="text-slate-500 italic font-light text-xs">
-                Awaiting acoustic transcription... Say &quot;Jarvis&quot; or activate live microphone stream.
+                Awaiting acoustic input... Say &quot;Jarvis&quot; to speak.
               </span>
             ) : (
               <span className="inline-block w-2 h-4 ml-1 bg-white/40 animate-pulse align-middle"></span>
@@ -418,15 +660,25 @@ export default function App() {
           </div>
         </div>
 
-        {/* Diagnostics & Status Indicator */}
-        <div className="flex flex-col gap-1">
-          <span className="text-[10px] font-mono text-cyan-400/60 uppercase tracking-wider">
-            Directive Status
-          </span>
-          <p className="text-xs font-medium tracking-wide text-cyan-100 font-mono bg-neutral-900/60 rounded-lg p-2.5 border border-cyan-500/15">
-            {statusMessage}
-          </p>
-        </div>
+        {/* agy Agent Response Pane (Conditional Display) */}
+        {agentResponse && (
+          <div className="relative rounded-xl bg-cyan-950/30 border border-cyan-500/30 p-4 backdrop-blur-md shadow-xl text-slate-100 flex flex-col gap-2">
+            <div className="flex items-center justify-between border-b border-cyan-500/20 pb-2">
+              <span className="text-[10px] font-mono uppercase tracking-widest text-cyan-400 font-semibold">
+                J.A.R.V.I.S. Response
+              </span>
+              <button
+                onClick={handleClearAgentResponse}
+                className="text-[10px] font-mono text-cyan-400 hover:text-cyan-200 underline cursor-pointer"
+              >
+                Dismiss
+              </button>
+            </div>
+            <p className="font-mono text-xs text-cyan-50 leading-relaxed max-h-40 overflow-y-auto pr-1">
+              {agentResponse}
+            </p>
+          </div>
+        )}
 
         {/* Quick Action Input / Command Line */}
         <form
@@ -439,19 +691,19 @@ export default function App() {
             type="text"
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
-            placeholder="Type a command (/voice, /stop, /test, /clear)..."
+            placeholder="Type directive for agy or command (/voice, /clear)..."
             className="w-full bg-transparent text-sm text-cyan-100 placeholder-cyan-600/50 outline-none font-mono"
           />
           <button
             type="submit"
-            className="text-xs font-mono font-semibold text-cyan-400 hover:text-cyan-200 uppercase tracking-wider px-2 py-1 rounded bg-cyan-950/60 border border-cyan-500/30 hover:border-cyan-400/60 transition-all"
+            className="text-xs font-mono font-semibold text-cyan-400 hover:text-cyan-200 uppercase tracking-wider px-2 py-1 rounded bg-cyan-950/60 border border-cyan-500/30 hover:border-cyan-400/60 transition-all cursor-pointer"
           >
             Send
           </button>
         </form>
 
         {/* Test Controls & Telemetry Footer */}
-        <div className="flex items-center justify-between text-[10px] font-mono text-cyan-400/50 pt-2 border-t border-cyan-500/10">
+        <div className="flex items-center justify-between text-[10px] font-mono text-cyan-400/50 pt-1.5 border-t border-cyan-500/10">
           <div className="flex items-center gap-2 flex-wrap">
             <button
               onClick={toggleWebAudioStream}
@@ -467,8 +719,17 @@ export default function App() {
             <button
               onClick={handleSimulateTokenStream}
               className="text-cyan-400 hover:text-cyan-200 underline cursor-pointer"
+              title="Test voice stream + auto-handoff to agent"
             >
               Simulate STT
+            </button>
+            <span>•</span>
+            <button
+              onClick={handleSimulateAgentTelemetry}
+              className="text-cyan-400 hover:text-cyan-200 underline cursor-pointer"
+              title="Test [Searching file system...], etc."
+            >
+              Test Status
             </button>
             <span>•</span>
             <button
@@ -477,13 +738,6 @@ export default function App() {
             >
               Wake
             </button>
-            <span>•</span>
-            <button
-              onClick={handleTriggerVoice}
-              className="text-cyan-400 hover:text-cyan-200 underline cursor-pointer"
-            >
-              /voice
-            </button>
           </div>
           <span className="hidden sm:inline">HYPRLAND: FLOATING</span>
         </div>
@@ -491,5 +745,6 @@ export default function App() {
     </main>
   );
 }
+
 
 

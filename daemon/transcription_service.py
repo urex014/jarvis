@@ -164,6 +164,20 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
                                 "text": final_text,
                                 "result": res.get("result", [])
                             })
+                            # Trigger command handoff to agy agent once silence threshold is reached
+                            ipc.send_event("command_handoff", {
+                                "prompt": final_text,
+                                "source": "speech_silence_threshold"
+                            })
+                            # Forward directly to agent socket if present
+                            if os.path.exists("/tmp/jarvis_agent.sock"):
+                                try:
+                                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as agent_sock:
+                                        agent_sock.settimeout(1.0)
+                                        agent_sock.connect("/tmp/jarvis_agent.sock")
+                                        agent_sock.sendall((json.dumps({"action": "prompt", "prompt": final_text}) + "\n").encode("utf-8"))
+                                except Exception as err:
+                                    logger.debug("Could not handoff to agent socket: %s", err)
                             last_partial = ""
                     else:
                         partial_res = json.loads(recognizer.PartialResult())

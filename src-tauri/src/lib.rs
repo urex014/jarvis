@@ -74,6 +74,44 @@ fn handle_incoming_ipc(app_handle: &tauri::AppHandle, line: &str) {
                 let _ = window.emit("stt-state", payload);
             }
         }
+        "command_handoff" => {
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.emit("command-handoff", &payload);
+                let _ = window.emit(
+                    "agent-status",
+                    serde_json::json!({
+                        "status": "[Analyzing prompt & planning strategy...]",
+                        "is_busy": true
+                    }),
+                );
+            }
+            if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
+                let script = PathBuf::from("/home/cryptic/projects/jarvis/.venv/bin/python");
+                let bridge = PathBuf::from("/home/cryptic/projects/jarvis/daemon/agy_bridge.py");
+                if script.exists() && bridge.exists() {
+                    let _ = Command::new(script)
+                        .arg(bridge)
+                        .arg("--prompt")
+                        .arg(prompt)
+                        .spawn();
+                }
+            }
+        }
+        "agent_status" => {
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.emit("agent-status", payload);
+            }
+        }
+        "agent_response" => {
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.emit("agent-response", payload);
+            }
+        }
+        "agent_delta" => {
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.emit("agent-delta", payload);
+            }
+        }
         _ => {}
     }
 }
@@ -160,6 +198,46 @@ fn get_voice_status() -> Result<String, String> {
     }
 }
 
+#[tauri::command]
+fn submit_agy_prompt(app_handle: tauri::AppHandle, prompt: String) -> Result<String, String> {
+    if let Some(window) = app_handle.get_webview_window("main") {
+        let _ = window.emit(
+            "agent-status",
+            serde_json::json!({
+                "status": "[Analyzing prompt & planning strategy...]",
+                "prompt": &prompt,
+                "is_busy": true
+            }),
+        );
+    }
+
+    let script = PathBuf::from("/home/cryptic/projects/jarvis/.venv/bin/python");
+    let bridge = PathBuf::from("/home/cryptic/projects/jarvis/daemon/agy_bridge.py");
+    if script.exists() && bridge.exists() {
+        let _ = Command::new(script)
+            .arg(bridge)
+            .arg("--prompt")
+            .arg(&prompt)
+            .spawn();
+    }
+    Ok("Prompt forwarded to agy agent".to_string())
+}
+
+#[tauri::command]
+fn simulate_agy_workflow(prompt: Option<String>) -> Result<String, String> {
+    let script = PathBuf::from("/home/cryptic/projects/jarvis/.venv/bin/python");
+    let bridge = PathBuf::from("/home/cryptic/projects/jarvis/daemon/agy_bridge.py");
+    let p = prompt.unwrap_or_else(|| "Analyze repository state and status".to_string());
+    if script.exists() && bridge.exists() {
+        let _ = Command::new(script)
+            .arg(bridge)
+            .arg("--simulate")
+            .arg(p)
+            .spawn();
+    }
+    Ok("Simulated agy workflow initiated".to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -195,7 +273,9 @@ pub fn run() {
             trigger_voice_route,
             stop_voice_route,
             push_stt_token,
-            get_voice_status
+            get_voice_status,
+            submit_agy_prompt,
+            simulate_agy_workflow
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
