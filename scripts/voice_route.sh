@@ -32,13 +32,13 @@ start_routing() {
     rm -f "$AUDIO_FIFO"
     mkfifo "$AUDIO_FIFO"
 
-    # Start audio recorder in background feeding the FIFO
+    # Start audio recorder in background feeding the FIFO via stdout redirect
     if command -v pw-record >/dev/null 2>&1; then
         log "Engaging PipeWire native capture (pw-record, 16kHz mono S16_LE)..."
-        (pw-record --rate=16000 --channels=1 --format=s16 "$AUDIO_FIFO" >/dev/null 2>&1 & echo $! > "$PID_FILE") || true
+        (pw-record --rate=16000 --channels=1 --format=s16 - > "$AUDIO_FIFO" 2>/dev/null & echo $! > "$PID_FILE") || true
     elif command -v arecord >/dev/null 2>&1; then
         log "Engaging ALSA capture (arecord, 16kHz mono S16_LE)..."
-        (arecord -q -r 16000 -c 1 -f S16_LE -t raw "$AUDIO_FIFO" >/dev/null 2>&1 & echo $! > "$PID_FILE") || true
+        (arecord -q -r 16000 -c 1 -f S16_LE -t raw - > "$AUDIO_FIFO" 2>/dev/null & echo $! > "$PID_FILE") || true
     else
         log "Warning: Neither pw-record nor arecord located on PATH."
     fi

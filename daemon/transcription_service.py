@@ -174,9 +174,11 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
 
         clean_prompt = re.sub(r'^(hey\s+)?jarvis\s*,?\s*', '', final_text, flags=re.IGNORECASE).strip()
         words = clean_prompt.split()
-        is_noise = len(words) <= 1 and clean_prompt.lower() in (
-            "huh", "um", "ah", "the", "a", "oh", "er", "m", "mm", "hmm", "is", "but", "one", "uni", "cool"
-        )
+        is_noise = len(words) == 0 or (len(words) == 1 and (
+            len(clean_prompt) <= 2 or clean_prompt.lower() in (
+                "ha", "huh", "um", "ah", "the", "a", "oh", "er", "m", "mm", "hmm", "is", "but", "one", "uni", "cool", "yeah", "hey", "hi", "so", "like"
+            )
+        ) and clean_prompt.lower() not in ("stop", "time", "date", "status", "help", "clear"))
 
         if clean_prompt and not is_noise:
             logger.info("Directive accepted: '%s'. Dispatching prompt and stopping microphone capture.", clean_prompt)
@@ -218,14 +220,17 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
                         running = False
                         break
 
-                    # Fast silence auto-commit: if user spoke a command and paused for 0.85s
-                    if last_partial and (time.time() - last_partial_time >= 0.85):
-                        logger.info("Fast silence threshold reached (0.85s). Finalizing prompt '%s'...", last_partial)
-                        res = json.loads(recognizer.FinalResult())
-                        final_candidate = res.get("text", "").strip() or last_partial
-                        if commit_prompt(final_candidate, res.get("result", [])):
-                            break
-                        last_partial = ""
+                    # Fast silence auto-commit: only if user spoke a meaningful phrase (>=2 words or known command)
+                    if last_partial and (time.time() - last_partial_time >= 0.9):
+                        clean_partial = re.sub(r'^(hey\s+)?jarvis\s*,?\s*', '', last_partial, flags=re.IGNORECASE).strip()
+                        partial_words = clean_partial.split()
+                        if len(partial_words) >= 2 or clean_partial.lower() in ("time", "status", "help", "date", "stop"):
+                            logger.info("Fast silence threshold reached (0.9s). Finalizing prompt '%s'...", last_partial)
+                            res = json.loads(recognizer.FinalResult())
+                            final_candidate = res.get("text", "").strip() or last_partial
+                            if commit_prompt(final_candidate, res.get("result", [])):
+                                break
+                            last_partial = ""
 
                     data = fifo.read(chunk_size)
                     if not data:
