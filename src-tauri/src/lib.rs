@@ -28,37 +28,54 @@ fn trigger_voice_routing() {
 }
 
 fn handle_incoming_ipc(app_handle: &tauri::AppHandle, line: &str) {
-    let payload: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or_else(|_| {
-        serde_json::json!({
-            "event": "wake_word",
-            "phrase": "jarvis"
-        })
-    });
+    let payload: serde_json::Value = match serde_json::from_str(line.trim()) {
+        Ok(val) => val,
+        Err(_) => return,
+    };
 
-    let phrase = payload
-        .get("phrase")
-        .and_then(|p| p.as_str())
-        .unwrap_or("jarvis");
+    let event_type = payload.get("event").and_then(|e| e.as_str()).unwrap_or("");
 
-    // 1. Show and focus window
-    if let Some(window) = app_handle.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-        let _ = window.emit(
-            "wake-word-detected",
-            serde_json::json!({
-                "phrase": phrase,
-                "timestamp": std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()
-            }),
-        );
+    match event_type {
+        "wake_word" => {
+            let phrase = payload
+                .get("phrase")
+                .and_then(|p| p.as_str())
+                .unwrap_or("jarvis");
+
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+                let _ = window.emit(
+                    "wake-word-detected",
+                    serde_json::json!({
+                        "phrase": phrase,
+                        "timestamp": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis()
+                    }),
+                );
+            }
+            trigger_voice_routing();
+        }
+        "stt_partial" => {
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.emit("stt-partial", payload);
+            }
+        }
+        "stt_final" => {
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.emit("stt-final", payload);
+            }
+        }
+        "stt_state" => {
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.emit("stt-state", payload);
+            }
+        }
+        _ => {}
     }
-
-    // 2. Trigger voice capture and routing
-    trigger_voice_routing();
 }
 
 #[tauri::command]
@@ -95,6 +112,40 @@ fn trigger_wake_word(app_handle: tauri::AppHandle, phrase: Option<String>) -> Re
 fn trigger_voice_route() -> Result<String, String> {
     trigger_voice_routing();
     Ok("Voice routing script dispatched".to_string())
+}
+
+#[tauri::command]
+fn stop_voice_route() -> Result<String, String> {
+    let script = get_voice_script_path();
+    if script.exists() {
+        let _ = Command::new("bash")
+            .arg(script)
+            .arg("stop")
+            .spawn();
+    }
+    Ok("Voice capture terminated".to_string())
+}
+
+#[tauri::command]
+fn push_stt_token(
+    app_handle: tauri::AppHandle,
+    text: String,
+    is_final: bool,
+) -> Result<(), String> {
+    if let Some(window) = app_handle.get_webview_window("main") {
+        let event_name = if is_final { "stt-final" } else { "stt-partial" };
+        let _ = window.emit(
+            event_name,
+            serde_json::json!({
+                "text": text,
+                "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            }),
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -142,6 +193,8 @@ pub fn run() {
             hide_window,
             trigger_wake_word,
             trigger_voice_route,
+            stop_voice_route,
+            push_stt_token,
             get_voice_status
         ])
         .run(tauri::generate_context!())

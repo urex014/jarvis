@@ -10,7 +10,10 @@ RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
 STATE_FILE="${RUNTIME_DIR}/jarvis_voice_state"
 AUDIO_FIFO="${RUNTIME_DIR}/jarvis_audio_stream.raw"
 PID_FILE="${RUNTIME_DIR}/jarvis_voice_recorder.pid"
+STT_PID_FILE="${RUNTIME_DIR}/jarvis_voice_stt.pid"
 LOG_FILE="${RUNTIME_DIR}/jarvis_voice_route.log"
+PROJECT_DIR="/home/cryptic/projects/jarvis"
+PYTHON_BIN="${PROJECT_DIR}/.venv/bin/python"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [VOICE_ROUTE] $*" | tee -a "$LOG_FILE"
@@ -46,6 +49,14 @@ start_routing() {
         log "Warning: Neither pw-record nor arecord located on PATH."
     fi
 
+    # Start transcription service in background if not already running
+    if [[ ! -f "$STT_PID_FILE" ]] || ! kill -0 "$(cat "$STT_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+        if [[ -x "$PYTHON_BIN" ]]; then
+            log "Launching background transcription engine (Vosk low-latency STT)..."
+            ("$PYTHON_BIN" "${PROJECT_DIR}/daemon/transcription_service.py" --fifo-path "$AUDIO_FIFO" >> "$LOG_FILE" 2>&1 & echo $! > "$STT_PID_FILE") || true
+        fi
+    fi
+
     log "Microphone routing initiated successfully. Audio stream buffered at $AUDIO_FIFO"
 }
 
@@ -59,16 +70,30 @@ stop_routing() {
         fi
         rm -f "$PID_FILE"
     fi
+
+    if [[ -f "$STT_PID_FILE" ]]; then
+        STT_PID="$(cat "$STT_PID_FILE" 2>/dev/null || true)"
+        if [[ -n "$STT_PID" ]] && kill -0 "$STT_PID" 2>/dev/null; then
+            kill "$STT_PID" 2>/dev/null || true
+            log "Terminated STT engine process $STT_PID."
+        fi
+        rm -f "$STT_PID_FILE"
+    fi
+
     echo "IDLE" > "$STATE_FILE"
     log "Microphone routing stopped."
 }
 
 status_routing() {
+    local rec_status="IDLE"
+    local stt_status="IDLE"
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo "ACTIVE (PID: $(cat "$PID_FILE"))"
-    else
-        echo "IDLE"
+        rec_status="ACTIVE (PID: $(cat "$PID_FILE"))"
     fi
+    if [[ -f "$STT_PID_FILE" ]] && kill -0 "$(cat "$STT_PID_FILE")" 2>/dev/null; then
+        stt_status="ACTIVE (PID: $(cat "$STT_PID_FILE"))"
+    fi
+    echo "RECORDER: ${rec_status} | STT_ENGINE: ${stt_status}"
 }
 
 case "${1:-start}" in
