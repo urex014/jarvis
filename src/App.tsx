@@ -47,11 +47,64 @@ export default function App() {
   const [autoHandoffEnabled, setAutoHandoffEnabled] = useState(true);
   const [isWsConnected, setIsWsConnected] = useState(false);
 
+  // Phase 5: Voice Synthesis & Auto-Hide
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [autoHideCountdown, setAutoHideCountdown] = useState<number | null>(null);
+
   const inputRef = useRef<HTMLInputElement>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Cancel any pending auto-hide timer
+  const cancelAutoHideTimer = useCallback(() => {
+    if (autoHideTimerRef.current) {
+      clearTimeout(autoHideTimerRef.current);
+      autoHideTimerRef.current = null;
+    }
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    setAutoHideCountdown(null);
+  }, []);
+
+  // Initiate auto-hide countdown: applies CSS opacity fade then Tauri hide_window
+  const startAutoHideTimer = useCallback((durationMs = 4000) => {
+    cancelAutoHideTimer();
+    let remaining = Math.round(durationMs / 1000);
+    setAutoHideCountdown(remaining);
+
+    countdownIntervalRef.current = setInterval(() => {
+      remaining -= 1;
+      if (remaining > 0) {
+        setAutoHideCountdown(remaining);
+      } else {
+        setAutoHideCountdown(null);
+        if (countdownIntervalRef.current) {
+          clearInterval(countdownIntervalRef.current);
+          countdownIntervalRef.current = null;
+        }
+      }
+    }, 1000);
+
+    autoHideTimerRef.current = setTimeout(async () => {
+      cancelAutoHideTimer();
+      // Apply CSS opacity transition to fade out the container
+      setIsVisible(false);
+      // Once fade transition concludes, trigger Tauri command to set window visibility to false
+      setTimeout(async () => {
+        try {
+          await invoke("hide_window");
+        } catch {
+          // Fallback outside Tauri
+        }
+      }, 500);
+    }, durationMs);
+  }, [cancelAutoHideTimer]);
 
   // Digital clock update
   useEffect(() => {
@@ -97,6 +150,16 @@ export default function App() {
               setAgentResponse(data.response || data.text || "");
               setIsAgentBusy(false);
               setAgentProcessStatus("[Task completed // Response ready]");
+            } else if (data.event === "tts_state") {
+              if (data.state === "speaking") {
+                cancelAutoHideTimer();
+                setIsSpeaking(true);
+                setAgentProcessStatus("[Speaking...]");
+              } else if (data.state === "finished") {
+                setIsSpeaking(false);
+                setAgentProcessStatus("[Systems nominal // Awaiting directive]");
+                startAutoHideTimer(4000);
+              }
             }
           } catch {
             // Ignore non-JSON
@@ -131,13 +194,14 @@ export default function App() {
         wsRef.current.close();
       }
     };
-  }, []);
+  }, [cancelAutoHideTimer, startAutoHideTimer]);
 
   // Dispatch prompt to agy agent via WebSocket or Tauri IPC
   const handoffPromptToAgent = useCallback(async (promptText: string) => {
     const trimmed = promptText.trim();
     if (!trimmed) return;
 
+    cancelAutoHideTimer();
     setIsAgentBusy(true);
     setAgentProcessStatus("[Analyzing prompt & planning strategy...]");
     setStatusMessage(`HANDING OFF PROMPT TO AGY: "${trimmed}"`);
@@ -156,7 +220,7 @@ export default function App() {
     } catch {
       // Fallback
     }
-  }, []);
+  }, [cancelAutoHideTimer]);
 
   // Listen for Tauri backend events
   useEffect(() => {
@@ -164,8 +228,9 @@ export default function App() {
 
     async function setupListeners() {
       try {
-        // 1. Wake word detection
+        // 1. Wake word detection: resets auto-hide and unhides window
         const unlistenWake = await listen<WakeWordPayload>("wake-word-detected", (event) => {
+          cancelAutoHideTimer();
           const phrase = event.payload?.phrase || "jarvis";
           setDetectedPhrase(phrase);
           setIsVisible(true);
@@ -181,6 +246,7 @@ export default function App() {
 
         // 2. STT streaming partial tokens
         const unlistenPartial = await listen<SttPayload>("stt-partial", (event) => {
+          cancelAutoHideTimer();
           const text = event.payload?.text || "";
           setTranscribedPartial(text);
           setIsListening(true);
@@ -200,8 +266,9 @@ export default function App() {
         });
         unlistenFns.push(unlistenPartial);
 
-        // 3. STT final recognized phrase (speech boundary / silence threshold reached by engine)
+        // 3. STT final recognized phrase
         const unlistenFinal = await listen<SttPayload>("stt-final", (event) => {
+          cancelAutoHideTimer();
           const text = event.payload?.text || "";
           if (silenceTimerRef.current) {
             clearTimeout(silenceTimerRef.current);
@@ -221,6 +288,7 @@ export default function App() {
         const unlistenState = await listen<{ state: string }>("stt-state", (event) => {
           const state = event.payload?.state || "idle";
           if (state === "listening") {
+            cancelAutoHideTimer();
             setIsListening(true);
           } else if (state === "idle") {
             setIsListening(false);
@@ -230,6 +298,7 @@ export default function App() {
 
         // 5. agy Agent Status updates from Tauri IPC
         const unlistenAgentStatus = await listen<AgentStatusPayload>("agent-status", (event) => {
+          cancelAutoHideTimer();
           const status = event.payload?.status || "[Processing...]";
           setAgentProcessStatus(status);
           if (event.payload?.is_busy !== undefined) {
@@ -247,6 +316,26 @@ export default function App() {
         });
         unlistenFns.push(unlistenAgentResp);
 
+        // 7. TTS state listener (synthesizing -> speaking -> finished -> auto-hide)
+        const unlistenTts = await listen<{ state: string; status?: string; text?: string }>("tts-state", (event) => {
+          const state = event.payload?.state;
+          if (state === "speaking") {
+            cancelAutoHideTimer();
+            setIsSpeaking(true);
+            setAgentProcessStatus("[Speaking...]");
+            setStatusMessage("VOICE SYNTHESIS ACTIVE // SPEAKING");
+          } else if (state === "synthesizing") {
+            cancelAutoHideTimer();
+            setAgentProcessStatus("[Synthesizing speech response...]");
+          } else if (state === "finished") {
+            setIsSpeaking(false);
+            setAgentProcessStatus("[Systems nominal // Awaiting directive]");
+            // Trigger 4-second auto-hide countdown once speech playback concludes
+            startAutoHideTimer(4000);
+          }
+        });
+        unlistenFns.push(unlistenTts);
+
       } catch (err) {
         console.warn("Tauri event listener failed to bind:", err);
       }
@@ -259,8 +348,9 @@ export default function App() {
       if (silenceTimerRef.current) {
         clearTimeout(silenceTimerRef.current);
       }
+      cancelAutoHideTimer();
     };
-  }, [autoHandoffEnabled, handoffPromptToAgent]);
+  }, [autoHandoffEnabled, handoffPromptToAgent, cancelAutoHideTimer, startAutoHideTimer]);
 
   // Keyboard shortcut: Escape hides window
   useEffect(() => {
@@ -433,6 +523,24 @@ export default function App() {
     }
   };
 
+  // Trigger manual TTS synthesis and speech playback
+  const handleTriggerTts = async () => {
+    cancelAutoHideTimer();
+    setIsSpeaking(true);
+    setAgentProcessStatus("[Speaking...]");
+    setStatusMessage("VOICE SYNTHESIS ACTIVE // SPEAKING");
+    const textToSpeak = agentResponse || "Diagnostics confirm all systems are functioning within normal parameters, Sir.";
+    try {
+      await invoke("trigger_tts_speak", { text: textToSpeak });
+    } catch {
+      setTimeout(() => {
+        setIsSpeaking(false);
+        setAgentProcessStatus("[Systems nominal // Awaiting directive]");
+        startAutoHideTimer(4000);
+      }, 3000);
+    }
+  };
+
   const handleClearTranscript = () => {
     setTranscribedFinal("");
     setTranscribedPartial("");
@@ -454,6 +562,8 @@ export default function App() {
       handleTriggerVoice();
     } else if (trimmed === "/stop") {
       handleStopVoice();
+    } else if (trimmed === "/speak") {
+      handleTriggerTts();
     } else if (trimmed === "/hide" || trimmed === "/dismiss") {
       handleDismiss();
     } else if (trimmed === "/wake") {
@@ -488,7 +598,9 @@ export default function App() {
             <span className="relative flex h-3 w-3">
               <span
                 className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
-                  isListening || isWebAudioActive
+                  isSpeaking
+                    ? "bg-amber-400"
+                    : isListening || isWebAudioActive
                     ? "bg-emerald-400"
                     : isAgentBusy
                     ? "bg-amber-400"
@@ -497,7 +609,9 @@ export default function App() {
               ></span>
               <span
                 className={`relative inline-flex rounded-full h-3 w-3 ${
-                  isListening || isWebAudioActive
+                  isSpeaking
+                    ? "bg-amber-500"
+                    : isListening || isWebAudioActive
                     ? "bg-emerald-500"
                     : isAgentBusy
                     ? "bg-amber-500"
@@ -528,14 +642,23 @@ export default function App() {
               <span className="text-[10px] font-mono text-cyan-400/60 uppercase tracking-widest">
                 Acoustic Telemetry
               </span>
-              {isWebAudioActive && (
+              {isSpeaking && (
+                <span className="text-[9px] font-mono bg-amber-950/80 text-amber-300 border border-amber-500/40 px-1.5 py-0.2 rounded animate-pulse">
+                  TTS ACTIVE
+                </span>
+              )}
+              {isWebAudioActive && !isSpeaking && (
                 <span className="text-[9px] font-mono bg-emerald-950/80 text-emerald-400 border border-emerald-500/30 px-1.5 py-0.2 rounded">
                   WEBRTC LIVE
                 </span>
               )}
             </div>
             <span className="text-xs font-mono font-medium text-cyan-100">
-              {isListening || isWebAudioActive ? (
+              {isSpeaking ? (
+                <span className="text-amber-300 font-semibold animate-pulse">
+                  AUDIO SYNTHESIS ❯ SPEAKING RESPONSE...
+                </span>
+              ) : isListening || isWebAudioActive ? (
                 <span className="text-emerald-400 font-semibold animate-pulse">
                   MICROPHONE ROUTED ❯ STT STREAM ACTIVE
                 </span>
@@ -550,24 +673,43 @@ export default function App() {
             )}
           </div>
 
-          {/* Dynamic Audio Wave Bars */}
+          {/* Dynamic Audio Wave Bars (Reactive to Speaking and Listening) */}
           <div className="flex items-end gap-1 h-7">
             {[40, 75, 100, 60, 90, 45, 80, 55, 30].map((height, idx) => (
               <span
                 key={idx}
                 className={`w-1 rounded-full transition-all duration-150 ${
-                  isListening || isWebAudioActive
+                  isSpeaking
+                    ? "bg-gradient-to-t from-amber-400 to-yellow-200 animate-pulse"
+                    : isListening || isWebAudioActive
                     ? "bg-gradient-to-t from-emerald-500 to-cyan-300 animate-pulse"
                     : "bg-cyan-500/20"
                 }`}
                 style={{
-                  height: isListening || isWebAudioActive ? `${height}%` : "20%",
+                  height: isSpeaking ? `${height * 1.1}%` : isListening || isWebAudioActive ? `${height}%` : "20%",
                   animationDelay: `${idx * 75}ms`,
                 }}
               />
             ))}
           </div>
         </div>
+
+        {/* Auto-Hide Countdown Banner */}
+        {autoHideCountdown !== null && (
+          <div className="flex items-center justify-between px-3.5 py-1.5 rounded-xl bg-cyan-950/30 border border-cyan-500/30 text-[10px] font-mono text-cyan-300 transition-all">
+            <div className="flex items-center gap-2">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping"></span>
+              <span>RESPONSE COMPLETE // AUTO-HIDING IN {autoHideCountdown}S...</span>
+            </div>
+            <button
+              onClick={cancelAutoHideTimer}
+              className="text-cyan-400 hover:text-white underline cursor-pointer uppercase font-bold text-[9px]"
+              title="Pin window and cancel auto-hide"
+            >
+              Pin Window
+            </button>
+          </div>
+        )}
 
         {/* Phase 4: Agent Process Display - Secondary Smaller Field with subtle pulse animation */}
         <div className="flex items-center justify-between px-3.5 py-2 rounded-xl bg-cyan-950/20 border border-cyan-500/20 text-xs font-mono transition-all">
@@ -731,12 +873,19 @@ export default function App() {
             >
               Test Status
             </button>
-            <span>•</span>
             <button
               onClick={handleSimulateWake}
               className="text-cyan-400 hover:text-cyan-200 underline cursor-pointer"
             >
               Wake
+            </button>
+            <span>•</span>
+            <button
+              onClick={handleTriggerTts}
+              className="text-amber-400 hover:text-amber-200 underline cursor-pointer"
+              title="Synthesize and play response via TTS"
+            >
+              Speak
             </button>
           </div>
           <span className="hidden sm:inline">HYPRLAND: FLOATING</span>

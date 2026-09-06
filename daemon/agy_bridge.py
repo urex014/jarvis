@@ -181,13 +181,10 @@ async def execute_agy_prompt(prompt: str, socket_path: str):
                     "status": "SUCCESS",
                     "done": True
                 })
+                if final_response:
+                    asyncio.create_task(invoke_tts_synthesis(final_response, socket_path))
 
         await process.wait()
-
-        await broadcast_event(socket_path, "agent_status", {
-            "status": "[Systems nominal // Awaiting directive]",
-            "is_busy": False
-        })
 
     except Exception as e:
         logger.error("Error running agy CLI: %s", e)
@@ -195,6 +192,19 @@ async def execute_agy_prompt(prompt: str, socket_path: str):
             "status": f"[Error: {str(e)[:40]}]",
             "is_busy": False
         })
+
+async def invoke_tts_synthesis(text: str, socket_path: str, simulate: bool = False):
+    """Spawns the TTS engine to synthesize and play the response audio."""
+    tts_script = str(PROJECT_ROOT / "daemon" / "tts_service.py")
+    python_bin = str(PROJECT_ROOT / ".venv" / "bin" / "python")
+    cmd = [python_bin, tts_script, text, "--socket-path", socket_path]
+    if simulate:
+        cmd.append("--simulate")
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd)
+        await proc.wait()
+    except Exception as e:
+        logger.error("Error executing TTS service: %s", e)
 
 async def simulate_agent_flow(prompt: str, socket_path: str):
     """Simulates realistic agy process telemetry updates for testing."""
@@ -223,10 +233,8 @@ async def simulate_agent_flow(prompt: str, socket_path: str):
         "done": True
     })
 
-    await broadcast_event(socket_path, "agent_status", {
-        "status": "[Systems nominal // Awaiting directive]",
-        "is_busy": False
-    })
+    # Trigger TTS simulation
+    asyncio.create_task(invoke_tts_synthesis(response_text, socket_path, simulate=True))
     logger.info("Simulated agy workflow completed successfully.")
 
 async def start_unix_listener(agent_sock_path: str, tauri_sock_path: str):

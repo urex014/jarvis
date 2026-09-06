@@ -112,6 +112,11 @@ fn handle_incoming_ipc(app_handle: &tauri::AppHandle, line: &str) {
                 let _ = window.emit("agent-delta", payload);
             }
         }
+        "tts_state" => {
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.emit("tts-state", payload);
+            }
+        }
         _ => {}
     }
 }
@@ -238,6 +243,19 @@ fn simulate_agy_workflow(prompt: Option<String>) -> Result<String, String> {
     Ok("Simulated agy workflow initiated".to_string())
 }
 
+#[tauri::command]
+fn trigger_tts_speak(text: String) -> Result<String, String> {
+    let script = PathBuf::from("/home/cryptic/projects/jarvis/.venv/bin/python");
+    let tts_daemon = PathBuf::from("/home/cryptic/projects/jarvis/daemon/tts_service.py");
+    if script.exists() && tts_daemon.exists() {
+        let _ = Command::new(script)
+            .arg(tts_daemon)
+            .arg(&text)
+            .spawn();
+    }
+    Ok("TTS synthesis dispatched".to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -275,7 +293,8 @@ pub fn run() {
             push_stt_token,
             get_voice_status,
             submit_agy_prompt,
-            simulate_agy_workflow
+            simulate_agy_workflow,
+            trigger_tts_speak
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
