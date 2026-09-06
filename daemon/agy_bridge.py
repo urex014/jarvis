@@ -159,15 +159,18 @@ async def execute_agy_prompt(prompt: str, socket_path: str):
         "is_busy": True
     })
 
-    # Strict voice directive: short, crisp, under 25 words
+    # Strict voice directive: short, crisp, under 25 words without tool delays
     brief_prompt = (
         f"{prompt}\n\n"
-        f"[VOICE DIRECTIVE: Provide an impeccably concise response in 1-2 brief sentences, "
-        f"strictly under 25 words total, suitable for British voice synthesis. Address user as Sir.]"
+        f"[VOICE DIRECTIVE: Provide an immediate vocal answer in 1-2 concise sentences, strictly under 25 words total. "
+        f"Do not call tools or execute terminal commands unless explicitly asked to perform an action. Address user as Sir.]"
     )
 
     cmd = [
         "agy",
+        "--model=gemini-3.8-flash-low",
+        "--effort=low",
+        "--disable-slash-commands",
         "--output-format", "stream-json",
         "--dangerously-skip-permissions",
         f"--print={brief_prompt}"

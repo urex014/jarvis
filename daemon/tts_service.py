@@ -160,6 +160,42 @@ def play_audio(audio_path: str):
         logger.warning("Audio playback error: %s", e)
         return False
 
+def stream_piper_speech(text: str, model_path: str) -> bool:
+    """Streams raw PCM from Piper directly into audio player for sub-second vocal onset."""
+    piper_bin = str(PIPER_BIN) if PIPER_BIN.exists() else "piper"
+    if not os.path.exists(model_path):
+        logger.error("Piper model not found: %s", model_path)
+        return False
+
+    player_cmd = ["aplay", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-q"]
+    if subprocess.run(["which", "aplay"], capture_output=True).returncode != 0:
+        player_cmd = ["paplay", "--raw", "--rate=22050", "--channels=1", "--format=s16le"]
+
+    logger.info("Engaging direct Piper audio stream via %s...", player_cmd[0])
+    try:
+        piper_proc = subprocess.Popen(
+            [piper_bin, "--model", model_path, "--output-raw"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL
+        )
+        player_proc = subprocess.Popen(
+            player_cmd,
+            stdin=piper_proc.stdout,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        piper_proc.stdin.write((text + "\n").encode("utf-8"))
+        piper_proc.stdin.close()
+        piper_proc.stdout.close()
+
+        piper_proc.wait(timeout=15)
+        player_proc.wait(timeout=25)
+        return player_proc.returncode == 0
+    except Exception as e:
+        logger.warning("Direct streaming playback error: %s", e)
+        return False
+
 def speak_text(text: str, socket_path: str = DEFAULT_SOCKET_PATH, model_path: str = DEFAULT_PIPER_MODEL):
     """Coordinates the full TTS synthesis, status dispatch, and playback cycle."""
     clean_text = clean_text_for_speech(text)
@@ -167,40 +203,7 @@ def speak_text(text: str, socket_path: str = DEFAULT_SOCKET_PATH, model_path: st
         logger.info("No pronounceable text to speak.")
         return
 
-    logger.info("Synthesizing speech for: '%s'", clean_text[:80])
-
-    # 1. Update UI state: [Synthesizing speech...]
-    send_ipc_event(socket_path, "tts_state", {
-        "state": "synthesizing",
-        "status": "[Synthesizing speech response...]",
-        "text": clean_text
-    })
-
-    # 2. Synthesis (ElevenLabs or Piper fallback)
-    api_key = os.environ.get("ELEVENLABS_API_KEY")
-    success = False
-
-    if api_key:
-        success = synthesize_with_elevenlabs(clean_text, OUTPUT_WAV, api_key)
-
-    if not success:
-        success = synthesize_with_piper(clean_text, OUTPUT_WAV, model_path)
-
-    if not success:
-        logger.info("Speech synthesis not completed or cancelled.")
-        send_ipc_event(socket_path, "tts_state", {
-            "state": "finished",
-            "status": "[Systems nominal // Awaiting directive]",
-            "text": clean_text
-        })
-        return
-
-    # 3. Notify UI of active playback: [Speaking...]
-    send_ipc_event(socket_path, "tts_state", {
-        "state": "speaking",
-        "status": "[Speaking...]",
-        "text": clean_text
-    })
+    logger.info("Synthesizing speech for: '%s'", clean_text)
 
     speaking_flag = "/tmp/jarvis_is_speaking"
     try:
@@ -210,10 +213,22 @@ def speak_text(text: str, socket_path: str = DEFAULT_SOCKET_PATH, model_path: st
         pass
 
     try:
-        # 4. Play audio through speakers
-        play_audio(OUTPUT_WAV)
+        # Notify UI of active speech state: [Speaking...]
+        send_ipc_event(socket_path, "tts_state", {
+            "state": "speaking",
+            "status": "[Speaking...]",
+            "text": clean_text
+        })
+
+        api_key = os.environ.get("ELEVENLABS_API_KEY")
+        if api_key and synthesize_with_elevenlabs(clean_text, OUTPUT_WAV, api_key):
+            play_audio(OUTPUT_WAV)
+        else:
+            # High-speed direct PCM streaming via Piper
+            stream_piper_speech(clean_text, model_path)
+
     finally:
-        # Echo dampening cooldown: allows speaker reverberation to decay
+        # Echo dampening cooldown: allows room reverberation to decay
         time.sleep(0.4)
         if os.path.exists(speaking_flag):
             try:
@@ -221,7 +236,7 @@ def speak_text(text: str, socket_path: str = DEFAULT_SOCKET_PATH, model_path: st
             except Exception:
                 pass
 
-    # 5. Notify UI that audio playback has finished -> triggers auto-hide logic
+    # Notify UI that audio playback has finished -> triggers auto-hide logic
     logger.info("Audio playback complete. Emitting finished event to initiate auto-hide timer.")
     send_ipc_event(socket_path, "tts_state", {
         "state": "finished",

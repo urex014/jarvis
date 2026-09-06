@@ -147,6 +147,58 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
 
     session_start_time = time.time()
     MAX_TURN_SECONDS = 7.0
+    last_partial = ""
+    last_partial_time = 0.0
+
+    def commit_prompt(final_text: str, result_meta: list = None) -> bool:
+        nonlocal running
+        if not final_text:
+            return False
+
+        # Immediate stop directive check on full utterance
+        if re.search(r'\b(stop|cancel|quiet|shut up)\b', final_text, re.IGNORECASE):
+            logger.info(">>> STOP DIRECTIVE DETECTED VIA STT: '%s' <<<", final_text)
+            subprocess.run(["bash", str(PROJECT_ROOT / "scripts" / "emergency_stop.sh")])
+            subprocess.Popen(["bash", str(PROJECT_ROOT / "scripts" / "voice_route.sh"), "stop"])
+            running = False
+            return True
+
+        if os.path.exists("/tmp/jarvis_is_speaking"):
+            logger.debug("TTS active; discarding speaker acoustic feedback: '%s'", final_text)
+            return False
+
+        ipc.send_event("stt_final", {
+            "text": final_text,
+            "result": result_meta or []
+        })
+
+        clean_prompt = re.sub(r'^(hey\s+)?jarvis\s*,?\s*', '', final_text, flags=re.IGNORECASE).strip()
+        words = clean_prompt.split()
+        is_noise = len(words) <= 1 and clean_prompt.lower() in (
+            "huh", "um", "ah", "the", "a", "oh", "er", "m", "mm", "hmm", "is", "but", "one", "uni", "cool"
+        )
+
+        if clean_prompt and not is_noise:
+            logger.info("Directive accepted: '%s'. Dispatching prompt and stopping microphone capture.", clean_prompt)
+            ipc.send_event("command_handoff", {
+                "prompt": clean_prompt,
+                "source": "speech_silence_threshold"
+            })
+            ipc.send_event("stt_state", {"state": "idle"})
+            if os.path.exists("/tmp/jarvis_agent.sock"):
+                try:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as agent_sock:
+                        agent_sock.settimeout(1.0)
+                        agent_sock.connect("/tmp/jarvis_agent.sock")
+                        agent_sock.sendall((json.dumps({"action": "prompt", "prompt": clean_prompt}) + "\n").encode("utf-8"))
+                        logger.info("Dispatched prompt to agent socket: '%s'", clean_prompt)
+                except Exception as err:
+                    logger.debug("Could not handoff to agent socket: %s", err)
+
+            subprocess.Popen(["bash", str(PROJECT_ROOT / "scripts" / "voice_route.sh"), "stop"])
+            running = False
+            return True
+        return False
 
     while running:
         if not os.path.exists(fifo_path):
@@ -159,12 +211,21 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
             with open(fifo_path, "rb") as fifo:
                 logger.info("Connected to audio stream buffer.")
                 while running:
-                    # Timeout check: single turn ends if user says nothing
+                    # Overall turn timeout
                     if time.time() - session_start_time > MAX_TURN_SECONDS:
                         logger.info("Turn duration exceeded (%.1fs). Shutting down microphone capture.", MAX_TURN_SECONDS)
                         subprocess.Popen(["bash", str(PROJECT_ROOT / "scripts" / "voice_route.sh"), "stop"])
                         running = False
                         break
+
+                    # Fast silence auto-commit: if user spoke a command and paused for 0.85s
+                    if last_partial and (time.time() - last_partial_time >= 0.85):
+                        logger.info("Fast silence threshold reached (0.85s). Finalizing prompt '%s'...", last_partial)
+                        res = json.loads(recognizer.FinalResult())
+                        final_candidate = res.get("text", "").strip() or last_partial
+                        if commit_prompt(final_candidate, res.get("result", [])):
+                            break
+                        last_partial = ""
 
                     data = fifo.read(chunk_size)
                     if not data:
@@ -176,63 +237,15 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
                         final_text = res.get("text", "").strip()
                         if final_text:
                             logger.info("[STT FINAL] %s", final_text)
-
-                            # 1. Immediate stop command check
-                            if re.search(r'\b(stop|cancel|quiet|shut up|halt)\b', final_text, re.IGNORECASE):
-                                logger.info(">>> STOP DIRECTIVE DETECTED VIA STT: '%s' <<<", final_text)
-                                subprocess.run(["bash", str(PROJECT_ROOT / "scripts" / "emergency_stop.sh")])
-                                subprocess.Popen(["bash", str(PROJECT_ROOT / "scripts" / "voice_route.sh"), "stop"])
-                                running = False
-                                break
-
-                            # 2. Check if TTS is currently active -> drop self-echo!
-                            if os.path.exists("/tmp/jarvis_is_speaking"):
-                                logger.debug("TTS active; discarding speaker acoustic feedback: '%s'", final_text)
-                                last_partial = ""
-                                continue
-
-                            ipc.send_event("stt_final", {
-                                "text": final_text,
-                                "result": res.get("result", [])
-                            })
-
-                            # Strip wake phrases if present at start of transcription
-                            clean_prompt = re.sub(r'^(hey\s+)?jarvis\s*,?\s*', '', final_text, flags=re.IGNORECASE).strip()
-                            words = clean_prompt.split()
-
-                            # Filter out single-word acoustic noise artifacts
-                            is_noise = len(words) <= 1 and clean_prompt.lower() in (
-                                "huh", "um", "ah", "the", "a", "oh", "er", "m", "mm", "hmm", "is", "but", "one", "uni", "cool"
-                            )
-
-                            if clean_prompt and not is_noise:
-                                logger.info("Directive accepted: '%s'. Dispatching prompt and stopping microphone capture.", clean_prompt)
-                                ipc.send_event("command_handoff", {
-                                    "prompt": clean_prompt,
-                                    "source": "speech_silence_threshold"
-                                })
-                                ipc.send_event("stt_state", {"state": "idle"})
-                                if os.path.exists("/tmp/jarvis_agent.sock"):
-                                    try:
-                                        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as agent_sock:
-                                            agent_sock.settimeout(1.0)
-                                            agent_sock.connect("/tmp/jarvis_agent.sock")
-                                            agent_sock.sendall((json.dumps({"action": "prompt", "prompt": clean_prompt}) + "\n").encode("utf-8"))
-                                            logger.info("Dispatched prompt to agent socket: '%s'", clean_prompt)
-                                    except Exception as err:
-                                        logger.debug("Could not handoff to agent socket: %s", err)
-
-                                # Shut down microphone capture immediately to eliminate speaker echo
-                                subprocess.Popen(["bash", str(PROJECT_ROOT / "scripts" / "voice_route.sh"), "stop"])
-                                running = False
+                            if commit_prompt(final_text, res.get("result", [])):
                                 break
                             last_partial = ""
                     else:
                         partial_res = json.loads(recognizer.PartialResult())
                         partial_text = partial_res.get("partial", "").strip()
                         if partial_text:
-                            # Immediate stop check on partial tokens
-                            if re.search(r'\b(stop|cancel|quiet|shut up|halt)\b', partial_text, re.IGNORECASE):
+                            # Immediate stop check on unambiguous multi-word partial phrases
+                            if re.search(r'\b(shut up|jarvis stop)\b', partial_text, re.IGNORECASE):
                                 logger.info(">>> STOP DIRECTIVE DETECTED (PARTIAL): '%s' <<<", partial_text)
                                 subprocess.run(["bash", str(PROJECT_ROOT / "scripts" / "emergency_stop.sh")])
                                 subprocess.Popen(["bash", str(PROJECT_ROOT / "scripts" / "voice_route.sh"), "stop"])
@@ -245,6 +258,7 @@ def run_vosk_fifo_stream(model_path: str, fifo_path: str, ipc: IPCClient):
 
                             if partial_text != last_partial:
                                 last_partial = partial_text
+                                last_partial_time = time.time()
                                 logger.debug("[STT PARTIAL] %s", partial_text)
                                 ipc.send_event("stt_partial", {
                                     "text": partial_text,

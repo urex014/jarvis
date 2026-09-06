@@ -42,15 +42,16 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 def play_wake_ack():
-    """Immediately plays acoustic acknowledgement ('Yes, Sir?') through system speakers."""
-    ack_path = PROJECT_ROOT / "wake_ack.wav"
+    """Plays subtle high-tech acoustic chime asynchronously upon wake word detection."""
+    ack_path = PROJECT_ROOT / "wake_chime.wav"
+    if not ack_path.exists():
+        ack_path = PROJECT_ROOT / "wake_ack.wav"
     if ack_path.exists():
         try:
-            proc = subprocess.Popen(["paplay", str(ack_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            proc.wait(timeout=1.2)
-            logger.info("Acoustic wake acknowledgement completed ('Yes, Sir?').")
+            subprocess.Popen(["paplay", str(ack_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logger.info("Acoustic wake acknowledgement chime dispatched.")
         except Exception as e:
-            logger.debug("Acoustic playback failed: %s", e)
+            logger.debug("Acoustic chime playback failed: %s", e)
 
 def notify_tauri_overlay(socket_path: str, phrase: str) -> bool:
     """Dispatches wake-word event to Tauri overlay and agent bridge sockets."""
@@ -105,16 +106,16 @@ def run_daemon(model_path: str, socket_path: str, voice_script: str, device=None
     else:
         model = Model(model_path)
 
-    # Constrain grammar to wake words + stop directives + unk
-    grammar = '["jarvis", "hey jarvis", "stop", "cancel", "quiet", "shut up", "halt", "[unk]"]'
+    # Constrain grammar to wake words + stop directives + unk (avoiding single-phoneme ambiguities like halt)
+    grammar = '["jarvis", "hey jarvis", "stop", "cancel", "quiet", "shut up", "jarvis stop", "[unk]"]'
     samplerate = 16000
     recognizer = KaldiRecognizer(model, samplerate, grammar)
     recognizer.SetWords(False)
 
-    logger.info("Wake & stop grammar loaded: 'jarvis', 'hey jarvis', 'stop', 'cancel', 'quiet', 'halt'.")
+    logger.info("Wake & stop grammar loaded: 'jarvis', 'hey jarvis', 'stop', 'cancel', 'quiet', 'shut up', 'jarvis stop'.")
     logger.info("Opening audio input stream at %d Hz...", samplerate)
 
-    cooldown_seconds = 2.5
+    cooldown_seconds = 2.0
     last_trigger_time = 0.0
 
     try:
@@ -136,8 +137,8 @@ def run_daemon(model_path: str, socket_path: str, voice_script: str, device=None
                 if recognizer.AcceptWaveform(data):
                     res = json.loads(recognizer.Result())
                     text = res.get("text", "").strip().lower()
-                    if text in ("stop", "cancel", "quiet", "shut up", "halt"):
-                        logger.info(">>> STOP DIRECTIVE DETECTED: '%s' <<<", text)
+                    if text in ("stop", "cancel", "quiet", "shut up", "jarvis stop"):
+                        logger.info(">>> STOP DIRECTIVE DETECTED (FULL UTTERANCE): '%s' <<<", text)
                         subprocess.run(["bash", str(PROJECT_ROOT / "scripts" / "emergency_stop.sh")])
                         recognizer.Reset()
                     elif text in ("jarvis", "hey jarvis"):
@@ -145,28 +146,30 @@ def run_daemon(model_path: str, socket_path: str, voice_script: str, device=None
                         if now - last_trigger_time > cooldown_seconds:
                             last_trigger_time = now
                             logger.info(">>> WAKE PHRASE DETECTED: '%s' <<<", text)
+                            trigger_voice_routing(voice_script)
                             play_wake_ack()
                             notify_tauri_overlay(socket_path, text)
-                            trigger_voice_routing(voice_script)
                         else:
                             logger.debug("Wake phrase '%s' ignored due to cooldown.", text)
                 else:
-                    # Check partial result for lower latency
-                    partial = json.loads(recognizer.PartialResult())
-                    partial_text = partial.get("partial", "").strip().lower()
-                    if partial_text in ("stop", "cancel", "quiet", "shut up", "halt"):
-                        logger.info(">>> STOP DIRECTIVE DETECTED (PARTIAL): '%s' <<<", partial_text)
-                        recognizer.Reset()
-                        subprocess.run(["bash", str(PROJECT_ROOT / "scripts" / "emergency_stop.sh")])
-                    elif partial_text in ("jarvis", "hey jarvis"):
-                        now = time.time()
-                        if now - last_trigger_time > cooldown_seconds:
-                            last_trigger_time = now
-                            logger.info(">>> WAKE PHRASE DETECTED (PARTIAL): '%s' <<<", partial_text)
+                    # Check partial result only for clear, multi-word or unambiguous phrases
+                    # NEVER trigger on 1-syllable partial tokens (like 'stop' which triggers on 's' in 'Sir' or 'systems')
+                    if not os.path.exists("/tmp/jarvis_is_speaking"):
+                        partial = json.loads(recognizer.PartialResult())
+                        partial_text = partial.get("partial", "").strip().lower()
+                        if partial_text in ("shut up", "jarvis stop"):
+                            logger.info(">>> STOP DIRECTIVE DETECTED (PARTIAL): '%s' <<<", partial_text)
                             recognizer.Reset()
-                            play_wake_ack()
-                            notify_tauri_overlay(socket_path, partial_text)
-                            trigger_voice_routing(voice_script)
+                            subprocess.run(["bash", str(PROJECT_ROOT / "scripts" / "emergency_stop.sh")])
+                        elif partial_text in ("jarvis", "hey jarvis"):
+                            now = time.time()
+                            if now - last_trigger_time > cooldown_seconds:
+                                last_trigger_time = now
+                                logger.info(">>> WAKE PHRASE DETECTED (PARTIAL): '%s' <<<", partial_text)
+                                recognizer.Reset()
+                                trigger_voice_routing(voice_script)
+                                play_wake_ack()
+                                notify_tauri_overlay(socket_path, partial_text)
 
     except Exception as e:
         logger.error("Audio stream failure: %s", e)
