@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Jarvis Overlay",
         "transparent": true,
         "decorations": false,

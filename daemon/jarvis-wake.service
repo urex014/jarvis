@@ -1,0 +1,14 @@
+[Unit]
+Description=J.A.R.V.I.S. Background Wake Word Detection Service
+After=sound.target pipewire.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/cryptic/projects/jarvis
+ExecStart=/home/cryptic/projects/jarvis/.venv/bin/python /home/cryptic/projects/jarvis/daemon/wake_word_daemon.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
