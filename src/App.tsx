@@ -32,7 +32,7 @@ export default function App() {
   const [isVisible, setIsVisible] = useState(true);
   const [isListening, setIsListening] = useState(false);
   const [isWebAudioActive, setIsWebAudioActive] = useState(false);
-  const [statusMessage, setStatusMessage] = useState("SYSTEMS NOMINAL // STANDING BY");
+  const [statusMessage, setStatusMessage] = useState("SYSTEMS operational// STANDING BY");
   const [detectedPhrase, setDetectedPhrase] = useState("");
   const [inputValue, setInputValue] = useState("");
   
